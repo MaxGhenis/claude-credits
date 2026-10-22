@@ -680,3 +680,54 @@ def test_unrelated_checks_do_not_move_an_exhaustion_into_the_next_cycle(env, mon
     cc.main(["check", "--free"])
     cc.main(["set", "default", "--renews-day", "18"])
     assert reg_key(tmp)["status_until"] == "2026-11-18"
+
+
+# ---------- regressions from Sol round 2 ----------
+
+def test_a_test_result_for_a_replaced_key_is_discarded(env, monkeypatch):
+    api, kr, _, tmp = env
+    _, k1 = add(env)
+    api.exhausted.add(k1)
+    real_http = cc.http
+
+    def swap_mid_test(method, path, key, body=None):
+        out = real_http(method, path, key, body)
+        if method == "POST" and key == k1:
+            with cc.registry_txn() as reg:
+                reg["keys"]["default"].update(fingerprint="sha256:new", status="ok", org_id="org-2")
+        return out
+    monkeypatch.setattr(cc, "http", swap_mid_test)
+    cc.main(["check"])
+    assert (reg_key(tmp)["status"], reg_key(tmp)["org_id"]) == ("ok", "org-2")
+
+
+def test_exec_name_refuses_a_recorded_exhaustion_on_an_inconclusive_test(env, monkeypatch):
+    api, *_ = env
+    _, key = add(env, "default", "org-1", None, "--renews-day", "17")
+    api.exhausted.add(key)
+    cc.main(["check"])
+    monkeypatch.setattr(cc, "http", lambda *a, **k: (0, {}, "network error: URLError"))
+    assert cc.main(["exec", "--name", "default", "--", "python3", "-c", "0"]) == 2
+
+
+def test_readding_with_a_new_renewal_day_recomputes_the_exhaustion(env):
+    api, kr, pasted, tmp = env
+    _, key = add(env, "default", "org-1", None, "--renews-day", "17")
+    api.exhausted.add(key)
+    cc.main(["check"])
+    pasted["v"] = key
+    assert cc.main(["add", "--replace", "--renews-day", "18", "--no-spend-probe"]) == 0
+    assert (reg_key(tmp)["status"], reg_key(tmp)["status_until"]) == ("exhausted", "2026-11-18")
+
+
+def test_a_legacy_exhaustion_record_is_not_stretched_by_a_later_check(env, monkeypatch):
+    api, kr, _, tmp = env
+    add(env, "default", "org-1", None, "--renews-day", "17")
+    with cc.registry_txn() as reg:
+        reg["keys"]["default"].update(status="exhausted", status_until="2026-11-17",
+                                      last_check="2026-10-22T12:00:00Z")
+        reg["keys"]["default"].pop("exhausted_seen", None)
+    monkeypatch.setattr(cc, "today", lambda: dt.date(2026, 11, 20))
+    cc.main(["check", "--free"])
+    cc.main(["set", "default", "--renews-day", "18"])
+    assert reg_key(tmp)["status_until"] == "2026-11-18"

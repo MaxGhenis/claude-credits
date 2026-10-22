@@ -467,6 +467,8 @@ def probe(key: str, spend: bool = True) -> dict:
 
 
 def apply_probe(e: dict, result: dict, ref: dt.date) -> None:
+    if e.get("status") == "exhausted" and not e.get("exhausted_seen") and e.get("last_check"):
+        e["exhausted_seen"] = e["last_check"][:10]  # older records: keep the original observation
     e["last_check"] = result["checked"]
     e["last_check_detail"] = result.get("detail", "")
     if result.get("org_id"):
@@ -482,7 +484,19 @@ def probe_stored(name: str, e: dict, spend: bool = True) -> dict:
     key = stored_key(name, e)
     if key is None:
         return {"checked": now(), "status": "invalid", "detail": "missing from the store", "verified": False}
-    return probe(key, spend=spend)
+    return {**probe(key, spend=spend), "fingerprint": fingerprint(key)}
+
+
+def commit_probe(name: str, result: dict, ref: dt.date) -> None:
+    """Record a test result, unless the key was replaced or removed while it ran (the
+    result belongs to the key that was tested, not to its successor)."""
+    with registry_txn() as reg:
+        e = reg["keys"].get(name)
+        if e is None:
+            return
+        if result.get("fingerprint") and e.get("fingerprint") != result["fingerprint"]:
+            return
+        apply_probe(e, result, ref)
 
 
 # ---------- reading the key ----------
@@ -578,8 +592,9 @@ def cmd_add(args) -> int:
             old_store = e.get("store")
             e.update({"store": store.kind, "kind": kind, "fingerprint": fp,
                       "added": e.get("added") or now(), "updated": now()})
-            if args.renews_day:
+            if args.renews_day and args.renews_day != e.get("renews_day"):
                 e["renews_day"] = args.renews_day
+                renewal_changed(e)
             apply_probe(e, result, ref)
             renews = e.get("renews_day")
     if old_store and old_store != store.kind:  # moved between stores: don't leave a copy behind
@@ -652,11 +667,9 @@ def cmd_check(args) -> int:
         else:
             if fingerprint(key) != e.get("fingerprint"):
                 print(f"warning  {name}: stored key doesn't match its registered fingerprint", file=sys.stderr)
-            result = probe(key, spend=not args.free)
+            result = {**probe(key, spend=not args.free), "fingerprint": fingerprint(key)}
         key = None
-        with registry_txn() as reg:
-            if name in reg["keys"]:
-                apply_probe(reg["keys"][name], result, ref)
+        commit_probe(name, result, ref)
         bad += result["status"] in ("invalid", "exhausted")
         print(f"{name:20} {result['status']:9} {result.get('detail', '')}")
     return 1 if bad else 0
@@ -678,9 +691,7 @@ def choose(verify: bool) -> str:
     else:
         for name in candidates + parked:
             result = probe_stored(name, keys[name])
-            with registry_txn() as reg:
-                if name in reg["keys"]:
-                    apply_probe(reg["keys"][name], result, ref)
+            commit_probe(name, result, ref)
             # A live key may go ahead on an inconclusive test; a parked one needs a clear yes.
             if result["status"] == "ok" or (result["status"] == "unknown" and name not in parked):
                 return name
@@ -711,13 +722,14 @@ def cmd_exec(args) -> int:
     if args.name:
         name = args.name
         if not args.no_verify:
-            result = probe_stored(name, entry(name))
-            with registry_txn() as reg:
-                if name in reg["keys"]:
-                    apply_probe(reg["keys"][name], result, today())
-            if result["status"] in ("exhausted", "invalid"):
-                raise Refused(f"{name!r}: {result['status']} ({result.get('detail', '')}). "
-                              "Pass --no-verify to run anyway.")
+            e = entry(name)
+            recorded = effective_status(e, today())
+            result = probe_stored(name, e)
+            commit_probe(name, result, today())
+            if result["status"] in ("exhausted", "invalid") or (
+                    result["status"] != "ok" and recorded in ("exhausted", "invalid")):
+                raise Refused(f"{name!r}: {result['status']} ({result.get('detail', '')}), recorded as "
+                              f"{recorded}. Pass --no-verify to run anyway.")
     else:
         name = choose(verify=not args.no_verify)
     key = stored_key(name, entry(name))
@@ -759,9 +771,9 @@ def cmd_mark(args) -> int:
             raise Refused(f"a test request on {args.name!r} just worked, so its credit isn't used up. The error "
                           "you saw was probably about the request: the credit refuses anything sent as Claude "
                           "Code or the Agent SDK. Pass --force to mark it anyway.")
+        commit_probe(args.name, result, ref)
         with registry_txn() as reg:
             k = reg["keys"][args.name]
-            apply_probe(k, result, ref)
             if result["status"] == "unknown":  # the test itself failed: take your word for a day
                 set_status(k, "exhausted", ref)
                 k["status_until"] = (ref + dt.timedelta(days=1)).isoformat()
