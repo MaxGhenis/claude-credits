@@ -131,10 +131,10 @@ def test_order_offers_each_live_key_once_and_no_dead_one(ks):
 
 
 @given(key_sets)
-def test_order_spends_ok_before_unknown_and_soonest_expiry_first(ks):
+def test_order_spends_soonest_expiry_first_then_ok_before_unknown(ks):
     out = cc.order(ks, REF)
-    rank = [(cc.effective_status(ks[n], REF) != "ok", cc.days_left(ks[n], REF) is None,
-             cc.days_left(ks[n], REF) or 0) for n in out]
+    rank = [(cc.days_left(ks[n], REF) is None, cc.days_left(ks[n], REF) or 0,
+             cc.effective_status(ks[n], REF) != "ok") for n in out]
     assert rank == sorted(rank)
 
 
@@ -149,6 +149,7 @@ def test_exhaustion_lapses_when_until_passes():
     a = {"status": "exhausted", "status_until": "2026-10-22"}
     assert cc.effective_status(a, REF) == "unknown"
     assert cc.effective_status({**a, "status_until": "2026-10-23"}, REF) == "exhausted"
+    assert cc.effective_status({"status": "exhausted"}, REF) == "unknown"   # no end date: re-check
 
 
 # ---------- commands ----------
@@ -175,6 +176,12 @@ def env(tmp_path, monkeypatch):
     api, kr = FakeAPI(), MemoryKeyring()
     monkeypatch.setenv("CLAUDE_CREDITS_HOME", str(tmp_path / "cfg"))
     monkeypatch.setattr(cc, "http", api.http)
+    monkeypatch.setattr(cc, "today", lambda: REF)
+
+    def no_real_exec(*a):  # a test that forgets to stub exec must fail, not replace pytest
+        raise AssertionError("os.execve called for real in a test")
+    monkeypatch.setattr(cc.os, "execve", no_real_exec)
+    monkeypatch.setattr(cc.subprocess, "call", no_real_exec)
     keyring.set_keyring(kr)
     pasted = {"v": ""}
     monkeypatch.setattr(cc.getpass, "getpass", lambda prompt="": pasted["v"])
@@ -265,7 +272,7 @@ def test_add_refuses_tokens_that_are_not_api_keys(env, capsys, bad, why):
 def test_add_refuses_legacy_keys_without_force(env):
     rc, _ = add(env, "old", "org-l", fake_key("api03"))
     assert rc == 2
-    rc, _ = add(env, "old", "org-l", fake_key("api03"), "--force")
+    rc, _ = add(env, "old", "org-l", fake_key("api03"), "--force")  # first attempt stored nothing
     assert rc == 0
 
 
@@ -306,7 +313,7 @@ def test_file_store_is_0600_and_holds_the_key(env):
 def test_moving_a_key_between_stores_leaves_no_copy(env):
     api, kr, _, tmp = env
     rc, key = add(env, "k", "org-m", None, "--file-store")
-    assert add(env, "k", "org-m", key)[0] == 0                       # same name, now keyring
+    assert add(env, "k", "org-m", key, "--replace")[0] == 0          # same name, now keyring
     assert kr.items[("claude-credits", "k")] == key
     assert json.loads((tmp / "cfg" / "keys.json").read_text()) == {}
 
@@ -322,7 +329,8 @@ def test_check_records_exhaustion_until_renewal(env):
 
 def test_pick_verify_skips_an_exhausted_key(env, capsys):
     api = env[0]
-    _, k1 = add(env, "soon", "org-1", None, "--renews-day", "1")
+    # the exhausted key expires first (Oct 25 vs Oct 28), so it is tested and must be skipped
+    _, k1 = add(env, "soon", "org-1", None, "--renews-day", "25")
     _, k2 = add(env, "later", "org-2", None, "--renews-day", "28")
     api.exhausted.add(k1)
     capsys.readouterr()
@@ -339,13 +347,13 @@ def test_pick_refuses_when_nothing_is_usable(env):
 def test_exec_passes_the_key_only_through_the_environment(env, monkeypatch, capsys):
     _, key = add(env)
     seen = {}
-    monkeypatch.setattr(cc.os, "execvpe", lambda f, a, e: seen.update(argv=a, env=e))
+    monkeypatch.setattr(cc.os, "execve", lambda f, a, e: seen.update(argv=a, env=e))
     monkeypatch.setattr(cc.subprocess, "call", lambda a, env: seen.update(argv=a, env=env) or 0)
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-should-go")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "should-go-too")
     capsys.readouterr()
     cc.main(["exec", "--", "python3", "job.py"])
-    assert seen["argv"] == ["python3", "job.py"]
+    assert os.path.basename(seen["argv"][0]).startswith("python3") and seen["argv"][1:] == ["job.py"]
     assert seen["env"]["ANTHROPIC_API_KEY"] == key and seen["env"]["CLAUDE_CREDITS_NAME"] == "default"
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in seen["env"] and "ANTHROPIC_AUTH_TOKEN" not in seen["env"]
     out = capsys.readouterr()
@@ -354,7 +362,7 @@ def test_exec_passes_the_key_only_through_the_environment(env, monkeypatch, caps
 
 def test_exec_warns_before_running_claude(env, monkeypatch, capsys):
     add(env)
-    monkeypatch.setattr(cc.os, "execvpe", lambda f, a, e: None)
+    monkeypatch.setattr(cc.os, "execve", lambda f, a, e: None)
     monkeypatch.setattr(cc.subprocess, "call", lambda a, env: 0)
     cc.main(["exec", "--", "claude", "-p", "hi"])
     assert "refused every `claude -p`" in capsys.readouterr().err
@@ -404,3 +412,218 @@ def test_real_keyring_round_trip(monkeypatch):
     finally:
         assert store.delete("t") is True
     assert store.get("t") is None and store.delete("t") is False
+
+
+# ---------- regressions from the 2026-10-22 review ----------
+
+def reg_key(tmp, name="default"):
+    return json.loads(registry_text(tmp))["keys"][name]
+
+
+def test_a_second_add_under_the_same_name_needs_replace(env, capsys):
+    api, kr, _, tmp = env
+    _, k1 = add(env, "default", "org-a")
+    rc, k2 = add(env, "default", "org-b")
+    assert rc == 2 and kr.items[("claude-credits", "default")] == k1
+    assert "--replace" in capsys.readouterr().err
+    rc, k2 = add(env, "default", "org-b", k2, "--replace")
+    assert rc == 0 and kr.items[("claude-credits", "default")] == k2
+    assert reg_key(tmp)["org_id"] == "org-b" and "replaced sha256:" in capsys.readouterr().out
+
+
+def test_exhaustion_seen_on_the_renewal_day_is_rechecked_the_next_day(env, monkeypatch):
+    api, kr, _, tmp = env
+    _, key = add(env, "default", "org-1", None, "--renews-day", "17")
+    api.exhausted.add(key)
+    monkeypatch.setattr(cc, "today", lambda: dt.date(2026, 11, 17))
+    assert cc.main(["check"]) == 1
+    assert reg_key(tmp)["status_until"] == "2026-11-18"
+    api.exhausted.discard(key)
+    monkeypatch.setattr(cc, "today", lambda: dt.date(2026, 11, 18))
+    assert cc.main(["pick", "--verify"]) == 0
+
+
+def test_exhaustion_without_a_renewal_day_is_rechecked_daily_and_set_recomputes(env):
+    api, kr, _, tmp = env
+    _, key = add(env)
+    api.exhausted.add(key)
+    cc.main(["check"])
+    assert reg_key(tmp)["status_until"] == "2026-10-23"
+    cc.main(["set", "default", "--renews-day", "1"])
+    assert reg_key(tmp)["status_until"] == "2026-11-01"
+
+
+def test_choose_retests_parked_keys_before_giving_up(env):
+    api, *_ = env
+    _, key = add(env, "default", "org-1", None, "--renews-day", "17")
+    api.exhausted.add(key)
+    cc.main(["check"])
+    api.exhausted.discard(key)
+    assert cc.main(["pick", "--verify"]) == 0
+
+
+def test_mark_exhausted_refuses_while_the_key_works(env, capsys):
+    api, kr, _, tmp = env
+    _, key = add(env)
+    assert cc.main(["mark", "default", "exhausted"]) == 2 and "isn't used up" in capsys.readouterr().err
+    api.exhausted.add(key)
+    assert cc.main(["mark", "default", "exhausted"]) == 0 and reg_key(tmp)["status"] == "exhausted"
+    assert cc.main(["mark", "default", "ok"]) == 0
+    n = len(api.calls)
+    assert cc.main(["mark", "default", "exhausted", "--force"]) == 0 and len(api.calls) == n
+
+
+@pytest.mark.parametrize("argv", [["add", "--renews-day", "32"], ["add", "--renews-day", "0"],
+                                  ["set", "default", "--renews-day", "x"],
+                                  ["mark", "default", "exhausted", "--until", "soon"]])
+def test_bad_dates_and_days_are_refused_before_anything_happens(env, argv):
+    api, kr, pasted, _ = env
+    pasted["v"] = fake_key()
+    with pytest.raises(SystemExit):
+        cc.main(argv)
+    assert kr.items == {} and api.calls == []
+
+
+def test_a_free_check_keeps_a_recorded_exhaustion(env):
+    api, kr, _, tmp = env
+    _, key = add(env, "default", "org-1", None, "--renews-day", "17")
+    api.exhausted.add(key)
+    cc.main(["check"])
+    cc.main(["check", "--free"])
+    assert (reg_key(tmp)["status"], reg_key(tmp)["status_until"]) == ("exhausted", "2026-11-17")
+
+
+def test_soonest_expiry_is_tried_first_even_when_unchecked(env, tmp_path):
+    add(env, "ok-later", "org-1", None, "--renews-day", "12")
+    add(env, "unknown-soon", "org-2", None, "--renews-day", "24", "--no-spend-probe")
+    assert cc.order(json.loads(registry_text(env[3]))["keys"], REF)[0] == "unknown-soon"
+
+
+def test_least_recently_used_breaks_ties():
+    ks = {"a": {"status": "ok", "renews_day": 5, "last_used": "2026-10-21T00:00:00Z"},
+          "b": {"status": "ok", "renews_day": 5, "last_used": "2026-10-01T00:00:00Z"}}
+    assert cc.order(ks, REF) == ["b", "a"]
+
+
+def test_add_refuses_when_the_api_cannot_be_reached_unless_offline(env, monkeypatch, capsys):
+    api, kr, pasted, _ = env
+    monkeypatch.setattr(cc, "http", lambda *a, **k: (0, {}, "network error: URLError"))
+    pasted["v"] = fake_key()
+    assert cc.main(["add"]) == 2 and kr.items == {} and "couldn't check" in capsys.readouterr().err
+    assert cc.main(["add", "--offline"]) == 0 and kr.items
+
+
+def test_stdin_on_a_terminal_uses_the_hidden_prompt(env, monkeypatch):
+    api, kr, pasted, _ = env
+    key = fake_key()
+    api.orgs[key] = "org-t"
+    pasted["v"] = key
+    import io
+
+    class TTY(io.StringIO):
+        def isatty(self):
+            return True
+    monkeypatch.setattr(cc.sys, "stdin", TTY("this would echo\n"))
+    assert cc.main(["add", "--stdin"]) == 0 and kr.items[("claude-credits", "default")] == key
+
+
+def test_a_stored_value_that_isnt_a_key_is_never_sent(env, capsys):
+    api, kr, _, _ = env
+    _, key = add(env)
+    kr.items[("claude-credits", "default")] = key + "\n"
+    n = len(api.calls)
+    assert cc.main(["check"]) == 2 and len(api.calls) == n
+    assert key not in capsys.readouterr().err
+
+
+def test_an_unreachable_keychain_gives_a_clean_refusal_and_remove_force_forgets(env, capsys):
+    api, kr, _, tmp = env
+    add(env)
+
+    class Locked(MemoryKeyring):
+        def get_password(self, s, u):
+            raise keyring.errors.KeyringLocked("locked")
+
+        def delete_password(self, s, u):
+            raise keyring.errors.KeyringLocked("locked")
+    keyring.set_keyring(Locked())
+    assert cc.main(["check"]) == 2 and "keychain refused" in capsys.readouterr().err
+    assert cc.main(["remove", "default", "--yes"]) == 2
+    assert cc.main(["remove", "default", "--yes", "--force"]) == 0
+    assert json.loads(registry_text(tmp))["keys"] == {}
+
+
+def test_relative_xdg_config_home_is_ignored(monkeypatch):
+    monkeypatch.delenv("CLAUDE_CREDITS_HOME", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", "")
+    assert os.path.isabs(cc.config_dir())
+    monkeypatch.setenv("XDG_CONFIG_HOME", "relative/dir")
+    assert os.path.isabs(cc.config_dir())
+
+
+def test_file_store_temp_files_are_private_and_cleaned_up(env):
+    api, kr, _, tmp = env
+    add(env, "srv", "org-f", None, "--file-store")
+    cfg = tmp / "cfg"
+    assert not [p for p in os.listdir(cfg) if p.endswith(".tmp")]
+    if os.name == "posix":
+        assert stat.S_IMODE(os.stat(cfg / "keys.json").st_mode) == 0o600
+
+
+def test_exec_refuses_a_missing_command_before_touching_the_key(env, capsys):
+    api, *_ = env
+    add(env)
+    n = len(api.calls)
+    assert cc.main(["exec", "--", "no-such-program-xyz"]) == 2
+    assert "command not found" in capsys.readouterr().err and len(api.calls) == n
+
+
+def test_examples_are_copied_into_a_folder(env, tmp_path):
+    dest = tmp_path / "ex"
+    assert cc.main(["examples", str(dest)]) == 0
+    assert sorted(os.listdir(dest)) == ["batch.py", "hello.py"]
+    (dest / "hello.py").write_text("mine")
+    assert cc.main(["examples", str(dest)]) == 0 and (dest / "hello.py").read_text() == "mine"
+
+
+def test_http_refuses_a_base_url_other_than_anthropic(monkeypatch):
+    monkeypatch.setattr(cc, "API_BASE", "http://evil.example.com")
+    with pytest.raises(cc.Refused, match="only go to"):
+        cc.http("GET", "/v1/models", "k")
+
+
+def test_http_never_follows_a_redirect_with_the_key(monkeypatch):
+    import http.server
+    import threading
+    seen = []
+
+    class Target(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(self.headers.get("x-api-key"))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    target = http.server.HTTPServer(("127.0.0.1", 0), Target)
+
+    class Redirector(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", f"http://localhost:{target.server_port}/stolen")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    redirector = http.server.HTTPServer(("127.0.0.1", 0), Redirector)
+    for srv in (target, redirector):
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setattr(cc, "API_BASE", f"http://127.0.0.1:{redirector.server_port}")
+        status, _, _ = cc.http("GET", "/v1/models", "sk-ant-usr-secret")
+        assert status == 302 and seen == []
+    finally:
+        target.shutdown()
+        redirector.shutdown()

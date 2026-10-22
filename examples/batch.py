@@ -49,7 +49,7 @@ else:
     except anthropic.BadRequestError as e:
         if "credit balance is too low" in str(e).lower():
             name = os.environ.get("CLAUDE_CREDITS_NAME", "default")
-            sys.exit(f"This plan's credit is used up for the cycle. Run: claude-credits mark {name} exhausted")
+            sys.exit(f"Anthropic says this plan's credit is used up. Run: claude-credits mark {name} exhausted")
         raise
     batch_id = batch.id
     print(f"submitted {len(prompts)} prompts as batch {batch_id}", file=sys.stderr)
@@ -75,7 +75,8 @@ for result in client.messages.batches.results(batch_id):  # arrives in any order
         row["text"] = next((b.text for b in msg.content if b.type == "text"), "")
         row["stop_reason"] = msg.stop_reason
     elif result.result.type == "errored":
-        row["error"] = f"{result.result.error.type}: {getattr(result.result.error, 'message', '')}"
+        err = getattr(result.result.error, "error", result.result.error)  # ErrorResponse wraps the error
+        row["error"] = f"{getattr(err, 'type', '')}: {getattr(err, 'message', '')}"
     else:
         row["error"] = result.result.type
     out.write(json.dumps(row) + "\n")

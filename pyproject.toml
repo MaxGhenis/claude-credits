@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "claude-credits"
-version = "0.1.0"
+version = "0.2.0"
 description = "Keep your Claude Max plan's monthly API credit key in your OS keychain and run jobs on it."
 readme = "README.md"
 license = "MIT"
@@ -16,6 +16,10 @@ claude-credits = "claude_credits:main"
 
 [tool.hatch.build.targets.wheel]
 only-include = ["claude_credits.py"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"examples/hello.py" = "claude_credits_examples/hello.py"
+"examples/batch.py" = "claude_credits_examples/batch.py"
 
 [tool.hatch.build.targets.sdist]
 only-include = ["claude_credits.py", "README.md", "LICENSE", "examples", "tests", "pyproject.toml"]

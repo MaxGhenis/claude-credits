@@ -28,7 +28,7 @@ try:
 except anthropic.BadRequestError as e:
     if "credit balance is too low" in str(e).lower():
         name = os.environ.get("CLAUDE_CREDITS_NAME", "default")
-        sys.exit(f"This plan's credit is used up for the cycle. Run: claude-credits mark {name} exhausted")
+        sys.exit(f"Anthropic says this plan's credit is used up. Run: claude-credits mark {name} exhausted")
     raise
 
 if response.stop_reason == "refusal":
