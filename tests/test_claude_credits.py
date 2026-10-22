@@ -627,3 +627,56 @@ def test_http_never_follows_a_redirect_with_the_key(monkeypatch):
     finally:
         target.shutdown()
         redirector.shutdown()
+
+
+# ---------- regressions from the Sol review of the shared logic ----------
+
+def test_concurrent_adds_cannot_both_claim_one_organization(env, monkeypatch):
+    import threading
+    import time as _time
+    api, kr, pasted, tmp = env
+    k1, k2 = fake_key(), fake_key()
+    api.orgs.update({k1: "org-same", k2: "org-same"})
+    real_put = cc.STORES["keyring"].put
+    monkeypatch.setattr(cc.STORES["keyring"], "put", lambda n, v: (_time.sleep(0.3), real_put(n, v)))
+    values = {"a": k1, "b": k2}
+    monkeypatch.setattr(cc, "read_key", lambda args: values[args.name])
+    rcs = {}
+    threads = [threading.Thread(target=lambda n=n: rcs.__setitem__(n, cc.main(["add", n]))) for n in "ab"]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(rcs.values()) == [0, 2]
+    assert len(json.loads(registry_text(tmp))["keys"]) == 1
+
+
+def test_a_parked_key_is_not_revived_by_an_inconclusive_test(env, monkeypatch):
+    api, *_ = env
+    _, key = add(env, "default", "org-1", None, "--renews-day", "17")
+    api.exhausted.add(key)
+    cc.main(["check"])
+    monkeypatch.setattr(cc, "http", lambda *a, **k: (0, {}, "network error: URLError"))
+    assert cc.main(["pick", "--verify"]) == 2
+
+
+def test_exec_name_is_verified_unless_no_verify(env, monkeypatch):
+    api, *_ = env
+    _, key = add(env)
+    api.exhausted.add(key)
+    ran = {}
+    monkeypatch.setattr(cc.os, "execve", lambda f, a, e: ran.update(argv=a))
+    assert cc.main(["exec", "--name", "default", "--", "python3", "-c", "0"]) == 2 and not ran
+    cc.main(["exec", "--name", "default", "--no-verify", "--", "python3", "-c", "0"])
+    assert ran["argv"][1:] == ["-c", "0"]
+
+
+def test_unrelated_checks_do_not_move_an_exhaustion_into_the_next_cycle(env, monkeypatch):
+    api, kr, _, tmp = env
+    _, key = add(env, "default", "org-1", None, "--renews-day", "17")
+    api.exhausted.add(key)
+    cc.main(["check"])
+    monkeypatch.setattr(cc, "today", lambda: dt.date(2026, 11, 20))
+    cc.main(["check", "--free"])
+    cc.main(["set", "default", "--renews-day", "18"])
+    assert reg_key(tmp)["status_until"] == "2026-11-18"

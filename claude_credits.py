@@ -287,6 +287,15 @@ def registry_txn(write: bool = True):
             os.replace(tmp, path)
 
 
+@contextlib.contextmanager
+def op_lock():
+    """Serializes whole add and remove operations: duplicate checks, the store write and
+    the registry write happen as one step. Lock order: op_lock, then the file store's lock,
+    then the registry lock; nothing that holds a later lock takes an earlier one."""
+    with _locked(os.path.join(config_dir(), "op.lock")):
+        yield
+
+
 def entry(name: str) -> dict:
     with registry_txn(write=False) as reg:
         if name not in reg["keys"]:
@@ -361,15 +370,20 @@ def order(keys: dict, ref: dt.date) -> list[str]:
 def set_status(e: dict, status: str, ref: dt.date) -> None:
     e["status"] = status
     if status == "exhausted":
+        e["exhausted_seen"] = ref.isoformat()
         e["status_until"] = exhausted_until(e, ref)
     else:
         e.pop("status_until", None)
+        e.pop("exhausted_seen", None)
 
 
 def renewal_changed(e: dict) -> None:
-    """Recompute a recorded exhaustion's end after the renewal day changes."""
-    if e.get("status") == "exhausted" and e.get("last_check"):
-        e["status_until"] = exhausted_until(e, dt.date.fromisoformat(e["last_check"][:10]))
+    """Recompute a recorded exhaustion's end after the renewal day changes, from the day
+    the exhaustion was seen (later unrelated checks don't move it)."""
+    if e.get("status") == "exhausted":
+        seen = e.get("exhausted_seen") or (e.get("last_check") or "")[:10]
+        if seen:
+            e["status_until"] = exhausted_until(e, dt.date.fromisoformat(seen))
 
 
 # ---------- API probes ----------
@@ -540,29 +554,34 @@ def cmd_add(args) -> int:
         if not result["verified"]:
             raise Refused(f"couldn't check the key with the API ({result.get('detail', '')}). Nothing was "
                           "stored. Try again, or pass --offline to store it unchecked.")
-    with registry_txn(write=False) as reg:
-        for other, e in reg["keys"].items():
-            if other == name:
-                continue
-            if e.get("fingerprint") == fp:
-                raise Refused(f"this key is already stored as {other!r}")
-            if result.get("org_id") and e.get("org_id") == result["org_id"] and not args.force:
-                raise Refused(f"this key's organization is already stored as {other!r}. Keys in one organization "
-                              "share one balance, so a second one adds nothing. Pass --force to keep both.")
-    store = STORES["file" if args.file_store else "keyring"]
-    store.put(name, value)
-    with registry_txn() as reg:
-        e = reg["keys"].setdefault(name, {})
-        if e.get("fingerprint") != fp:  # a new key starts with a clean status
-            for k in ("status", "status_until", "last_used", "org_id", "rate_limits"):
-                e.pop(k, None)
-        old_store = e.get("store")
-        e.update({"store": store.kind, "kind": kind, "fingerprint": fp,
-                  "added": e.get("added") or now(), "updated": now()})
-        if args.renews_day:
-            e["renews_day"] = args.renews_day
-        apply_probe(e, result, ref)
-        renews = e.get("renews_day")
+    with op_lock():
+        with registry_txn(write=False) as reg:
+            previous = dict(reg["keys"].get(name, {}))
+        if previous and not args.replace:
+            raise Refused(f"a key named {name!r} was stored meanwhile. Pass --replace to swap it.")
+        with registry_txn(write=False) as reg:
+            for other, e in reg["keys"].items():
+                if other == name:
+                    continue
+                if e.get("fingerprint") == fp:
+                    raise Refused(f"this key is already stored as {other!r}")
+                if result.get("org_id") and e.get("org_id") == result["org_id"] and not args.force:
+                    raise Refused(f"this key's organization is already stored as {other!r}. Keys in one organization "
+                                  "share one balance, so a second one adds nothing. Pass --force to keep both.")
+        store = STORES["file" if args.file_store else "keyring"]
+        store.put(name, value)
+        with registry_txn() as reg:
+            e = reg["keys"].setdefault(name, {})
+            if e.get("fingerprint") != fp:  # a new key starts with a clean status
+                for k in ("status", "status_until", "last_used", "org_id", "rate_limits"):
+                    e.pop(k, None)
+            old_store = e.get("store")
+            e.update({"store": store.kind, "kind": kind, "fingerprint": fp,
+                      "added": e.get("added") or now(), "updated": now()})
+            if args.renews_day:
+                e["renews_day"] = args.renews_day
+            apply_probe(e, result, ref)
+            renews = e.get("renews_day")
     if old_store and old_store != store.kind:  # moved between stores: don't leave a copy behind
         try:
             STORES[old_store].delete(name)
@@ -636,7 +655,8 @@ def cmd_check(args) -> int:
             result = probe(key, spend=not args.free)
         key = None
         with registry_txn() as reg:
-            apply_probe(reg["keys"][name], result, ref)
+            if name in reg["keys"]:
+                apply_probe(reg["keys"][name], result, ref)
         bad += result["status"] in ("invalid", "exhausted")
         print(f"{name:20} {result['status']:9} {result.get('detail', '')}")
     return 1 if bad else 0
@@ -659,8 +679,10 @@ def choose(verify: bool) -> str:
         for name in candidates + parked:
             result = probe_stored(name, keys[name])
             with registry_txn() as reg:
-                apply_probe(reg["keys"][name], result, ref)
-            if result["status"] in ("ok", "unknown"):
+                if name in reg["keys"]:
+                    apply_probe(reg["keys"][name], result, ref)
+            # A live key may go ahead on an inconclusive test; a parked one needs a clear yes.
+            if result["status"] == "ok" or (result["status"] == "unknown" and name not in parked):
                 return name
     raise Refused("no usable key: every stored key is exhausted, invalid or missing. Run: claude-credits check")
 
@@ -686,12 +708,24 @@ def cmd_exec(args) -> int:
         print("claude-credits: warning: on 2026-10-22 the credit refused every `claude -p` request "
               "(\"Credit balance is too low\"). It covers your own API calls and Managed Agents.", file=sys.stderr)
     resolved = resolve_command(cmd)
-    name = args.name or choose(verify=not args.no_verify)
+    if args.name:
+        name = args.name
+        if not args.no_verify:
+            result = probe_stored(name, entry(name))
+            with registry_txn() as reg:
+                if name in reg["keys"]:
+                    apply_probe(reg["keys"][name], result, today())
+            if result["status"] in ("exhausted", "invalid"):
+                raise Refused(f"{name!r}: {result['status']} ({result.get('detail', '')}). "
+                              "Pass --no-verify to run anyway.")
+    else:
+        name = choose(verify=not args.no_verify)
     key = stored_key(name, entry(name))
     if key is None:
         raise Refused(f"{name!r} is missing from its store; add it again")
     with registry_txn() as reg:
-        reg["keys"][name]["last_used"] = now()
+        if name in reg["keys"]:
+            reg["keys"][name]["last_used"] = now()
     env = {k: v for k, v in os.environ.items() if k not in STRIP_ENV}
     env.update(ANTHROPIC_API_KEY=key, CLAUDE_CREDITS_NAME=name)
     if sys.platform == "win32":
@@ -749,16 +783,17 @@ def cmd_mark(args) -> int:
 def cmd_remove(args) -> int:
     if not args.yes:
         raise Refused(f"this deletes the key {args.name!r} from this computer. Rerun with --yes.")
-    e = entry(args.name)
-    try:
-        gone = store_for(e).delete(args.name)
-    except Refused as err:
-        if not args.force:
-            raise Refused(f"{err} To forget the key here anyway, rerun with --force "
-                          "(and delete the copy from your keychain by hand).")
-        gone = False
-    with registry_txn() as reg:
-        reg["keys"].pop(args.name, None)
+    with op_lock():
+        e = entry(args.name)
+        try:
+            gone = store_for(e).delete(args.name)
+        except Refused as err:
+            if not args.force:
+                raise Refused(f"{err} To forget the key here anyway, rerun with --force "
+                              "(and delete the copy from your keychain by hand).")
+            gone = False
+        with registry_txn() as reg:
+            reg["keys"].pop(args.name, None)
     print(f"removed {args.name}" + ("" if gone else " (the store had no copy, or couldn't be reached)"))
     print("note     this only deletes it here. To revoke the key itself, delete it at platform.claude.com > API keys.")
     return 0
