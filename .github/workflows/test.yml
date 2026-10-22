@@ -1,0 +1,34 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.10", "3.13"]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Tests
+        run: uv run --no-project --with pytest --with hypothesis --with keyring pytest -q
+      - name: Build, install the wheel, and run it
+        run: |
+          uv build --out-dir dist
+          wheel=$(ls dist/*.whl)
+          uvx --from "$wheel" claude-credits --version
+          CLAUDE_CREDITS_HOME="$RUNNER_TEMP/cc-home" uvx --from "$wheel" claude-credits list
+          uvx --from "$wheel" claude-credits examples "$RUNNER_TEMP/examples"
+          test -f "$RUNNER_TEMP/examples/hello.py" && test -f "$RUNNER_TEMP/examples/batch.py"

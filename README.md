@@ -1,5 +1,7 @@
 # claude-credits
 
+[![tests](https://github.com/MaxGhenis/claude-credits/actions/workflows/test.yml/badge.svg)](https://github.com/MaxGhenis/claude-credits/actions/workflows/test.yml)
+
 Your Claude Max plan comes with monthly Claude API credit: $200 per billing cycle on Max
 20x, $100 on Max 5x. Unused credit expires at the end of each cycle. `claude-credits`
 keeps your API key in your operating system's keychain and runs your jobs on that

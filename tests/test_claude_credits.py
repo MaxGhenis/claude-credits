@@ -25,6 +25,9 @@ import keyring.errors
 import pytest
 from hypothesis import given, settings, strategies as st
 
+settings.register_profile("portable", deadline=None)  # shared CI runners are slow and uneven
+settings.load_profile("portable")
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import claude_credits as cc  # noqa: E402
 
@@ -352,8 +355,8 @@ def test_exec_passes_the_key_only_through_the_environment(env, monkeypatch, caps
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-should-go")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "should-go-too")
     capsys.readouterr()
-    cc.main(["exec", "--", "python3", "job.py"])
-    assert os.path.basename(seen["argv"][0]).startswith("python3") and seen["argv"][1:] == ["job.py"]
+    cc.main(["exec", "--", sys.executable, "job.py"])
+    assert seen["argv"] == [sys.executable, "job.py"]
     assert seen["env"]["ANTHROPIC_API_KEY"] == key and seen["env"]["CLAUDE_CREDITS_NAME"] == "default"
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in seen["env"] and "ANTHROPIC_AUTH_TOKEN" not in seen["env"]
     out = capsys.readouterr()
@@ -666,8 +669,9 @@ def test_exec_name_is_verified_unless_no_verify(env, monkeypatch):
     api.exhausted.add(key)
     ran = {}
     monkeypatch.setattr(cc.os, "execve", lambda f, a, e: ran.update(argv=a))
-    assert cc.main(["exec", "--name", "default", "--", "python3", "-c", "0"]) == 2 and not ran
-    cc.main(["exec", "--name", "default", "--no-verify", "--", "python3", "-c", "0"])
+    monkeypatch.setattr(cc.subprocess, "call", lambda a, env: ran.update(argv=a) or 0)
+    assert cc.main(["exec", "--name", "default", "--", sys.executable, "-c", "0"]) == 2 and not ran
+    cc.main(["exec", "--name", "default", "--no-verify", "--", sys.executable, "-c", "0"])
     assert ran["argv"][1:] == ["-c", "0"]
 
 
@@ -707,7 +711,7 @@ def test_exec_name_refuses_a_recorded_exhaustion_on_an_inconclusive_test(env, mo
     api.exhausted.add(key)
     cc.main(["check"])
     monkeypatch.setattr(cc, "http", lambda *a, **k: (0, {}, "network error: URLError"))
-    assert cc.main(["exec", "--name", "default", "--", "python3", "-c", "0"]) == 2
+    assert cc.main(["exec", "--name", "default", "--", sys.executable, "-c", "0"]) == 2
 
 
 def test_readding_with_a_new_renewal_day_recomputes_the_exhaustion(env):
