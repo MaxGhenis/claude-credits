@@ -482,8 +482,9 @@ def apply_probe(e: dict, result: dict, ref: dt.date) -> None:
 
 def probe_stored(name: str, e: dict, spend: bool = True) -> dict:
     key = stored_key(name, e)
-    if key is None:
-        return {"checked": now(), "status": "invalid", "detail": "missing from the store", "verified": False}
+    if key is None:  # tagged with the key we expected, so a replace that lands meanwhile discards it
+        return {"checked": now(), "status": "invalid", "detail": "missing from the store", "verified": False,
+                "fingerprint": e.get("fingerprint")}
     return {**probe(key, spend=spend), "fingerprint": fingerprint(key)}
 
 
@@ -663,7 +664,8 @@ def cmd_check(args) -> int:
     for name, e in entries.items():
         key = stored_key(name, e)
         if key is None:
-            result = {"checked": now(), "status": "invalid", "detail": "missing from the store"}
+            result = {"checked": now(), "status": "invalid", "detail": "missing from the store",
+                      "fingerprint": e.get("fingerprint")}
         else:
             if fingerprint(key) != e.get("fingerprint"):
                 print(f"warning  {name}: stored key doesn't match its registered fingerprint", file=sys.stderr)
