@@ -132,9 +132,11 @@ your own work, and don't give it to anyone else.
 - `add` refuses things that aren't API keys: a `claude setup-token` token, an Admin key,
   or a legacy `sk-ant-api` key (unless you pass `--force`). It won't replace a stored key
   without `--replace`.
-- `--clipboard` clears the clipboard after storing the key. Clipboard history tools
-  (Win+V, Paste, Klipper) may still hold a copy. The default hidden prompt avoids the
-  clipboard entirely.
+- The hidden prompt keeps the key off your screen. If you pasted it there, your clipboard
+  still holds it. `--clipboard` reads the key from the clipboard and clears it after
+  storing; otherwise copy something else afterwards. Clipboard history tools (Win+V,
+  Paste, Klipper) may keep a copy either way. If a terminal can't hide input, `add`
+  refuses rather than showing the key.
 - `remove` deletes the key from this computer only. To revoke it, delete it at
   platform.claude.com > API keys.
 

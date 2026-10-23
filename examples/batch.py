@@ -37,7 +37,8 @@ if args.results:
 else:
     if not args.prompts:
         p.error("give a prompts file, or --results BATCH_ID")
-    prompts = [line.strip() for line in open(args.prompts) if line.strip()]
+    with open(args.prompts, encoding="utf-8-sig") as fh:  # not the locale's encoding (cp1252 on Windows)
+        prompts = [line.strip() for line in fh if line.strip()]
     params = {"model": args.model, "max_tokens": args.max_tokens}
     if args.system:
         params["system"] = args.system
@@ -62,7 +63,7 @@ while True:
           f"(Ctrl-C is safe; resume with --results {batch_id})", file=sys.stderr)
     time.sleep(args.poll)
 
-out = open(args.out, "w") if args.out else sys.stdout
+out = open(args.out, "w", encoding="utf-8") if args.out else sys.stdout
 counts = {"succeeded": 0, "errored": 0, "canceled": 0, "expired": 0}
 for result in client.messages.batches.results(batch_id):  # arrives in any order: key by custom_id
     n = int(result.custom_id.split("-", 1)[1])

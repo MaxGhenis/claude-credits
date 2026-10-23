@@ -10,6 +10,7 @@ Run: uv run --with pytest --with hypothesis --with keyring pytest -q
 from __future__ import annotations
 
 import calendar
+import contextlib
 import datetime as dt
 import json
 import os
@@ -60,6 +61,18 @@ class MemoryKeyring(keyring.backend.KeyringBackend):
         if (service, username) not in self.items:
             raise keyring.errors.PasswordDeleteError("not found")
         del self.items[(service, username)]
+
+
+def kr_value(kr, name):
+    """The value stored for `name` (slots are `name#<fingerprint>`, or plain `name` for old entries)."""
+    vals = [v for (svc, user), v in kr.items.items()
+            if svc == "claude-credits" and (user == name or user.startswith(name + "#"))]
+    assert len(vals) <= 1, f"more than one stored copy of {name}: {len(vals)}"
+    return vals[0] if vals else None
+
+
+def kr_slot(kr, name):
+    return next(k for k in kr.items if k[0] == "claude-credits" and (k[1] == name or k[1].startswith(name + "#")))
 
 
 # ---------- keys ----------
@@ -207,7 +220,7 @@ def registry_text(tmp) -> str:
 def test_add_puts_the_key_in_the_keychain_and_only_metadata_in_the_registry(env, capsys):
     api, kr, _, tmp = env
     rc, key = add(env)
-    assert rc == 0 and kr.items[("claude-credits", "default")] == key
+    assert rc == 0 and kr_value(kr, "default") == key
     text = registry_text(tmp)
     assert key not in text and key[11:31] not in text
     if os.name == "posix":
@@ -249,7 +262,7 @@ def test_add_reads_stdin_too(env, monkeypatch):
     api.orgs[key] = "org-s"
     import io
     monkeypatch.setattr(cc.sys, "stdin", io.StringIO(key + "\n"))
-    assert cc.main(["add", "ci", "--stdin"]) == 0 and kr.items[("claude-credits", "ci")] == key
+    assert cc.main(["add", "ci", "--stdin"]) == 0 and kr_value(kr, "ci") == key
 
 
 def test_add_refuses_a_rejected_key_and_stores_nothing(env, capsys):
@@ -293,7 +306,7 @@ def test_add_refuses_the_same_key_twice(env):
 def test_add_offline_stores_without_calling_the_api(env):
     api, kr, _, tmp = env
     rc, key = add(env, "air", "org-x", None, "--offline")
-    assert rc == 0 and api.calls == [] and kr.items[("claude-credits", "air")] == key
+    assert rc == 0 and api.calls == [] and kr_value(kr, "air") == key
     assert json.loads(registry_text(tmp))["keys"]["air"]["status"] == "unknown"
 
 
@@ -306,18 +319,20 @@ def test_file_store_is_0600_and_holds_the_key(env):
     rc, key = add(env, "srv", "org-f", None, "--file-store")
     assert rc == 0 and kr.items == {}
     keys_file = tmp / "cfg" / "keys.json"
-    assert json.loads(keys_file.read_text()) == {"srv": key}
+    assert list(json.loads(keys_file.read_text()).values()) == [key]
     if os.name == "posix":
         assert stat.S_IMODE(os.stat(keys_file).st_mode) == 0o600
         os.chmod(keys_file, 0o644)
-        assert cc.main(["check", "srv"]) == 2  # refuses a key file others can read
+        n = len(api.calls)
+        assert cc.main(["check", "srv"]) == 0 and len(api.calls) == n   # won't read a key file others can read
+        assert reg_key(tmp, "srv")["status"] == "ok"                    # and that says nothing about the key
 
 
 def test_moving_a_key_between_stores_leaves_no_copy(env):
     api, kr, _, tmp = env
     rc, key = add(env, "k", "org-m", None, "--file-store")
     assert add(env, "k", "org-m", key, "--replace")[0] == 0          # same name, now keyring
-    assert kr.items[("claude-credits", "k")] == key
+    assert kr_value(kr, "k") == key
     assert json.loads((tmp / "cfg" / "keys.json").read_text()) == {}
 
 
@@ -427,10 +442,10 @@ def test_a_second_add_under_the_same_name_needs_replace(env, capsys):
     api, kr, _, tmp = env
     _, k1 = add(env, "default", "org-a")
     rc, k2 = add(env, "default", "org-b")
-    assert rc == 2 and kr.items[("claude-credits", "default")] == k1
+    assert rc == 2 and kr_value(kr, "default") == k1
     assert "--replace" in capsys.readouterr().err
     rc, k2 = add(env, "default", "org-b", k2, "--replace")
-    assert rc == 0 and kr.items[("claude-credits", "default")] == k2
+    assert rc == 0 and kr_value(kr, "default") == k2
     assert reg_key(tmp)["org_id"] == "org-b" and "replaced sha256:" in capsys.readouterr().out
 
 
@@ -527,16 +542,17 @@ def test_stdin_on_a_terminal_uses_the_hidden_prompt(env, monkeypatch):
         def isatty(self):
             return True
     monkeypatch.setattr(cc.sys, "stdin", TTY("this would echo\n"))
-    assert cc.main(["add", "--stdin"]) == 0 and kr.items[("claude-credits", "default")] == key
+    assert cc.main(["add", "--stdin"]) == 0 and kr_value(kr, "default") == key
 
 
 def test_a_stored_value_that_isnt_a_key_is_never_sent(env, capsys):
     api, kr, _, _ = env
     _, key = add(env)
-    kr.items[("claude-credits", "default")] = key + "\n"
+    kr.items[kr_slot(kr, "default")] = key + "\n"
     n = len(api.calls)
-    assert cc.main(["check"]) == 2 and len(api.calls) == n
-    assert key not in capsys.readouterr().err
+    assert cc.main(["check"]) == 1 and len(api.calls) == n
+    out = capsys.readouterr()
+    assert key not in out.out + out.err and "isn't an API key" in out.out
 
 
 def test_an_unreachable_keychain_gives_a_clean_refusal_and_remove_force_forgets(env, capsys):
@@ -550,7 +566,8 @@ def test_an_unreachable_keychain_gives_a_clean_refusal_and_remove_force_forgets(
         def delete_password(self, s, u):
             raise keyring.errors.KeyringLocked("locked")
     keyring.set_keyring(Locked())
-    assert cc.main(["check"]) == 2 and "keychain refused" in capsys.readouterr().err
+    assert cc.main(["check"]) == 0 and "keychain refused" in capsys.readouterr().out
+    assert reg_key(tmp)["status"] == "ok"   # a locked keychain says nothing about the key
     assert cc.main(["remove", "default", "--yes"]) == 2
     assert cc.main(["remove", "default", "--yes", "--force"]) == 0
     assert json.loads(registry_text(tmp))["keys"] == {}
@@ -735,3 +752,132 @@ def test_a_legacy_exhaustion_record_is_not_stretched_by_a_later_check(env, monke
     cc.main(["check", "--free"])
     cc.main(["set", "default", "--renews-day", "18"])
     assert reg_key(tmp)["status_until"] == "2026-11-18"
+
+
+# ---------- regressions from the Sol package review ----------
+
+def test_a_terminal_that_cannot_hide_input_is_refused_before_reading(env, monkeypatch, capsys):
+    api, kr, _, _ = env
+    read = {"n": 0}
+
+    def fallback_getpass(prompt=""):
+        import warnings
+        warnings.warn("Can not control echo on the terminal.", cc.getpass.GetPassWarning)
+        read["n"] += 1          # only reached if the warning didn't stop us
+        return fake_key()
+    monkeypatch.setattr(cc.getpass, "getpass", fallback_getpass)
+    assert cc.main(["add"]) == 2 and read["n"] == 0 and kr.items == {}
+    assert "can't hide" in capsys.readouterr().err
+
+
+def test_a_failed_registry_write_leaves_the_old_key_and_record(env, monkeypatch):
+    api, kr, pasted, tmp = env
+    _, k1 = add(env, "default", "org-1")
+    before = registry_text(tmp)
+    k2 = fake_key()
+    api.orgs[k2] = "org-2"
+    pasted["v"] = k2
+    real_txn = cc.registry_txn
+
+    @contextlib.contextmanager
+    def failing_writes(write=True):
+        with real_txn(write=False) as reg:
+            yield reg
+        if write:
+            raise OSError("disk full")
+    monkeypatch.setattr(cc, "registry_txn", failing_writes)
+    with pytest.raises(OSError):
+        cc.main(["add", "--replace"])
+    monkeypatch.setattr(cc, "registry_txn", real_txn)
+    assert registry_text(tmp) == before
+    assert kr_value(kr, "default") == k1                   # the staged k2 slot was removed
+    assert cc.stored_key("default", cc.entry("default")) == k1
+
+
+def test_moving_stores_cleans_up_inside_the_operation_lock(env, monkeypatch):
+    api, kr, pasted, tmp = env
+    _, key = add(env, "k", "org-m", None, "--file-store")
+    state, seen = {"locked": False}, []
+    real_op = cc.op_lock
+
+    @contextlib.contextmanager
+    def tracking_op_lock():
+        with real_op():
+            state["locked"] = True
+            try:
+                yield
+            finally:
+                state["locked"] = False
+    real_delete = cc.STORES["file"].delete
+    monkeypatch.setattr(cc, "op_lock", tracking_op_lock)
+    monkeypatch.setattr(cc.STORES["file"], "delete", lambda n: (seen.append(state["locked"]), real_delete(n))[1])
+    assert add(env, "k", "org-m", key, "--replace")[0] == 0
+    assert seen == [True] and kr_value(kr, "k") == key
+
+
+def test_a_denied_keychain_delete_is_not_reported_as_absent(env, capsys):
+    api, kr, _, tmp = env
+    add(env)
+
+    class DenyDelete(MemoryKeyring):
+        def delete_password(self, s, u):
+            raise keyring.errors.PasswordDeleteError("access denied")
+    stuck = DenyDelete()
+    stuck.items = kr.items
+    keyring.set_keyring(stuck)
+    assert cc.main(["remove", "default", "--yes"]) == 2
+    assert "wouldn't delete" in capsys.readouterr().err
+    assert "default" in json.loads(registry_text(tmp))["keys"]
+
+
+def test_mark_refuses_when_the_key_is_replaced_mid_test(env, monkeypatch):
+    api, kr, _, tmp = env
+    _, k1 = add(env)
+    real_http = cc.http
+
+    def swap_then_fail(method, path, key, body=None):
+        with cc.registry_txn() as reg:
+            reg["keys"]["default"]["fingerprint"] = "sha256:replacement"
+        return 0, {}, "network error: URLError"
+    monkeypatch.setattr(cc, "http", swap_then_fail)
+    assert cc.main(["mark", "default", "exhausted"]) == 2
+    assert reg_key(tmp).get("status") != "exhausted"
+
+
+def test_a_stored_key_that_does_not_match_its_record_is_never_sent(env, monkeypatch, capsys):
+    api, kr, _, tmp = env
+    _, k1 = add(env)
+    other = fake_key()
+    kr.items[kr_slot(kr, "default")] = other              # swapped outside the tool
+    n = len(api.calls)
+    assert cc.main(["exec", "--name", "default", "--", sys.executable, "-c", "0"]) == 2
+    assert len(api.calls) == n and other not in capsys.readouterr().err
+
+
+def test_windows_lock_keeps_retrying_past_ten_seconds_of_contention(monkeypatch):
+    class FakeMsvcrt:
+        LK_NBLCK, LK_UNLCK = 2, 0
+
+        def __init__(self):
+            self.fails = 150           # 15 s of contention at 0.1 s per try
+
+        def locking(self, fd, mode, n):
+            if mode == self.LK_NBLCK and self.fails:
+                self.fails -= 1
+                raise OSError(13, "locked")
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cc.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(cc.time, "sleep", lambda d: clock.__setitem__("t", clock["t"] + d))
+    fake = FakeMsvcrt()
+    import io
+
+    class F(io.StringIO):
+        name = "op.lock"
+
+        def fileno(self):
+            return 3
+    cc._win_lock(F(), fake, wait=600)
+    assert fake.fails == 0 and clock["t"] >= 14.9
+    fake.fails = 10 ** 9
+    with pytest.raises(cc.Refused, match="still locked"):
+        cc._win_lock(F(), fake, wait=1)

@@ -35,6 +35,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -59,6 +60,7 @@ PROBE_MODEL = os.environ.get("CLAUDE_CREDITS_PROBE_MODEL", "claude-haiku-5-5")
 KEYRING_SERVICE = "claude-credits"
 TIMEOUT = 60
 DEFAULT_NAME = "default"
+LOCK_WAIT = 600  # seconds to wait for another claude-credits run to finish
 
 # Console keys: personal (usr), service-account (svc) and legacy (api03).
 KEY_RE = re.compile(r"sk-ant-(?P<kind>usr|svc|api)(?P<ver>\d{2})?-[A-Za-z0-9_-]{40,}")
@@ -77,6 +79,10 @@ EXAMPLES = ("hello.py", "batch.py")
 
 class Refused(Exception):
     """A check failed: say why, change nothing."""
+
+
+class BadStoredKey(Refused):
+    """The store holds something for this name, but not the key its record describes."""
 
 
 def now() -> str:
@@ -164,6 +170,9 @@ class KeyringStore:
                 raise Refused("the keychain didn't return the key as written")
 
     def delete(self, name: str) -> bool:
+        """True if deleted, False if it wasn't there. keyring reports every failed delete
+        (absent, access denied, ...) as PasswordDeleteError, so absence is confirmed by a
+        lookup before it's believed."""
         with self._errors():
             kr = self._kr()
             from keyring.errors import PasswordDeleteError
@@ -171,7 +180,9 @@ class KeyringStore:
                 kr.delete_password(KEYRING_SERVICE, name)
                 return True
             except PasswordDeleteError:
-                return False
+                if kr.get_password(KEYRING_SERVICE, name) is None:
+                    return False
+                raise Refused("the OS keychain wouldn't delete the key (access denied?)")
 
 
 class FileStore:
@@ -230,16 +241,30 @@ def store_for(entry: dict):
     return STORES[entry.get("store", "keyring")]
 
 
+def secret_id(name: str, entry: dict) -> str:
+    """Where `name`'s key sits in its store. Each key version gets its own slot
+    (`name#<fingerprint>`), so replacing a key never overwrites the one the registry still
+    points to; entries from before that keep the plain name."""
+    return entry.get("secret_id") or name
+
+
+def new_secret_id(name: str, fp: str) -> str:
+    return f"{name}#{fp[len('sha256:'):]}"
+
+
 def stored_key(name: str, entry: dict) -> str | None:
     """The key for `name` from its store, re-checked: a value edited outside the tool
-    (a stray newline, say) is refused here rather than sent anywhere."""
-    value = store_for(entry).get(name)
+    (a stray newline, say), or one that doesn't match the registry's fingerprint, is
+    refused here rather than sent anywhere."""
+    value = store_for(entry).get(secret_id(name, entry))
     if value is None:
         return None
     try:
         classify(value)
     except Refused:
-        raise Refused(f"the value stored for {name!r} isn't an API key; add it again")
+        raise BadStoredKey(f"the value stored for {name!r} isn't an API key; add it again")
+    if entry.get("fingerprint") and fingerprint(value) != entry["fingerprint"]:
+        raise BadStoredKey(f"the key stored for {name!r} doesn't match its record; add it again")
     return value
 
 
@@ -251,8 +276,7 @@ def _locked(path: str):
     with open(path, "a") as fh:
         if sys.platform == "win32":
             import msvcrt
-            fh.seek(0)
-            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            _win_lock(fh, msvcrt)
             try:
                 yield
             finally:
@@ -265,6 +289,21 @@ def _locked(path: str):
                 yield
             finally:
                 fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _win_lock(fh, msvcrt, wait: float | None = None) -> None:
+    """Lock byte 0 of `fh`, retrying while another run holds it. msvcrt's own blocking mode
+    gives up after about ten seconds, too short for a keychain prompt."""
+    deadline = time.monotonic() + (LOCK_WAIT if wait is None else wait)
+    while True:
+        fh.seek(0)
+        try:
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            return
+        except OSError:
+            if time.monotonic() > deadline:
+                raise Refused(f"{fh.name} is still locked; another claude-credits seems to be running")
+            time.sleep(0.1)
 
 
 @contextlib.contextmanager
@@ -528,7 +567,16 @@ def clear_clipboard_if(value: str) -> bool:
 
 
 def prompt_key() -> str:
-    return getpass.getpass("Paste your Claude API key (sk-ant-usr-…; input hidden): ").strip()
+    """Read the key at a hidden prompt. If the terminal can't hide input, getpass would
+    warn and read it visibly; that warning is turned into a refusal before anything is read."""
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", getpass.GetPassWarning)
+        try:
+            return getpass.getpass("Paste your Claude API key (sk-ant-usr-…; input hidden): ").strip()
+        except getpass.GetPassWarning:
+            raise Refused("this terminal can't hide what you type, so the key would show. Pipe it in instead "
+                          "(… | claude-credits add --stdin) or use --clipboard.")
 
 
 def read_key(args) -> str:
@@ -584,26 +632,33 @@ def cmd_add(args) -> int:
                     raise Refused(f"this key's organization is already stored as {other!r}. Keys in one organization "
                                   "share one balance, so a second one adds nothing. Pass --force to keep both.")
         store = STORES["file" if args.file_store else "keyring"]
-        store.put(name, value)
-        with registry_txn() as reg:
-            e = reg["keys"].setdefault(name, {})
-            if e.get("fingerprint") != fp:  # a new key starts with a clean status
-                for k in ("status", "status_until", "last_used", "org_id", "rate_limits"):
-                    e.pop(k, None)
-            old_store = e.get("store")
-            e.update({"store": store.kind, "kind": kind, "fingerprint": fp,
-                      "added": e.get("added") or now(), "updated": now()})
-            if args.renews_day and args.renews_day != e.get("renews_day"):
-                e["renews_day"] = args.renews_day
-                renewal_changed(e)
-            apply_probe(e, result, ref)
-            renews = e.get("renews_day")
-    if old_store and old_store != store.kind:  # moved between stores: don't leave a copy behind
+        sid = new_secret_id(name, fp)
+        old_slot = (previous.get("store", "keyring"), secret_id(name, previous)) if previous else None
+        store.put(sid, value)  # staged: the registry still points at the old slot
         try:
-            STORES[old_store].delete(name)
-        except Refused as err:
-            print(f"warning  couldn't delete the old copy from the {old_store} store ({err}); "
-                  "remove it by hand", file=sys.stderr)
+            with registry_txn() as reg:
+                e = reg["keys"].setdefault(name, {})
+                if e.get("fingerprint") != fp:  # a new key starts with a clean status
+                    for k in ("status", "status_until", "exhausted_seen", "last_used", "org_id", "rate_limits"):
+                        e.pop(k, None)
+                e.update({"store": store.kind, "secret_id": sid, "kind": kind, "fingerprint": fp,
+                          "added": e.get("added") or now(), "updated": now()})
+                if args.renews_day and args.renews_day != e.get("renews_day"):
+                    e["renews_day"] = args.renews_day
+                    renewal_changed(e)
+                apply_probe(e, result, ref)
+                renews = e.get("renews_day")
+        except BaseException:
+            if old_slot != (store.kind, sid):  # unstage; the old key and its record are untouched
+                with contextlib.suppress(Exception):
+                    store.delete(sid)
+            raise
+        if old_slot and old_slot != (store.kind, sid):  # the predecessor, now unreferenced
+            try:
+                STORES[old_slot[0]].delete(old_slot[1])
+            except Refused as err:
+                print(f"warning  couldn't delete the previous key from the {old_slot[0]} store ({err}); "
+                      "remove it by hand", file=sys.stderr)
     cleared = args.clipboard and not args.keep_clipboard and clear_clipboard_if(value)
     value = ""
     where = "your OS keychain" if store.kind == "keyring" else FileStore().path()
@@ -662,13 +717,18 @@ def cmd_check(args) -> int:
         raise Refused("no such key: " + ", ".join(missing))
     bad = 0
     for name, e in entries.items():
-        key = stored_key(name, e)
-        if key is None:
+        try:
+            key, result = stored_key(name, e), None
+        except BadStoredKey as err:  # the stored value itself is wrong
+            key, result = None, {"checked": now(), "status": "invalid", "detail": str(err),
+                                 "fingerprint": e.get("fingerprint")}
+        except Refused as err:       # the store couldn't be read: says nothing about the key
+            key, result = None, {"checked": now(), "status": "unknown", "detail": str(err),
+                                 "fingerprint": e.get("fingerprint")}
+        if result is None and key is None:
             result = {"checked": now(), "status": "invalid", "detail": "missing from the store",
                       "fingerprint": e.get("fingerprint")}
-        else:
-            if fingerprint(key) != e.get("fingerprint"):
-                print(f"warning  {name}: stored key doesn't match its registered fingerprint", file=sys.stderr)
+        elif result is None:
             result = {**probe(key, spend=not args.free), "fingerprint": fingerprint(key)}
         key = None
         commit_probe(name, result, ref)
@@ -773,9 +833,13 @@ def cmd_mark(args) -> int:
             raise Refused(f"a test request on {args.name!r} just worked, so its credit isn't used up. The error "
                           "you saw was probably about the request: the credit refuses anything sent as Claude "
                           "Code or the Agent SDK. Pass --force to mark it anyway.")
-        commit_probe(args.name, result, ref)
         with registry_txn() as reg:
-            k = reg["keys"][args.name]
+            k = reg["keys"].get(args.name)
+            if k is None:
+                raise Refused(f"{args.name!r} was removed meanwhile; nothing was marked")
+            if result.get("fingerprint") and k.get("fingerprint") != result["fingerprint"]:
+                raise Refused(f"{args.name!r} was replaced while it was being tested; nothing was marked")
+            apply_probe(k, result, ref)
             if result["status"] == "unknown":  # the test itself failed: take your word for a day
                 set_status(k, "exhausted", ref)
                 k["status_until"] = (ref + dt.timedelta(days=1)).isoformat()
@@ -785,7 +849,9 @@ def cmd_mark(args) -> int:
         print(f"{args.name}: {status} ({result.get('detail', '')})")
         return 0
     with registry_txn() as reg:
-        k = reg["keys"][args.name]
+        k = reg["keys"].get(args.name)
+        if k is None:
+            raise Refused(f"{args.name!r} was removed meanwhile; nothing was marked")
         set_status(k, args.state, ref)
         k["last_check_detail"] = "marked by hand"
         if args.state == "exhausted" and args.until:
@@ -800,7 +866,7 @@ def cmd_remove(args) -> int:
     with op_lock():
         e = entry(args.name)
         try:
-            gone = store_for(e).delete(args.name)
+            gone = store_for(e).delete(secret_id(args.name, e))
         except Refused as err:
             if not args.force:
                 raise Refused(f"{err} To forget the key here anyway, rerun with --force "
