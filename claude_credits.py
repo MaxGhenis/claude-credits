@@ -335,6 +335,56 @@ def op_lock():
         yield
 
 
+def _published(name: str, sid: str) -> bool | None:
+    """Whether the registry already points `name` at slot `sid` (None if it can't be read)."""
+    try:
+        with registry_txn(write=False) as reg:
+            return reg["keys"].get(name, {}).get("secret_id") == sid
+    except Exception:
+        return None
+
+
+def _remember_leftover(name: str, kind: str, slot: str, reason: str) -> None:
+    with contextlib.suppress(Exception):
+        with registry_txn() as reg:
+            leftovers = reg.setdefault("leftovers", [])
+            if {"name": name, "store": kind, "slot": slot} not in leftovers:
+                leftovers.append({"name": name, "store": kind, "slot": slot})
+    print(f"warning  a copy of the key for {name!r} is left in the {kind} store ({reason}). "
+          "`claude-credits remove` or the next `add` will try to delete it again.", file=sys.stderr)
+
+
+def _discard_slot(name: str, kind: str, slot: str) -> None:
+    """Delete a slot nothing references; if that fails, remember it for a later retry."""
+    try:
+        STORES[kind].delete(slot)
+    except Exception as err:
+        _remember_leftover(name, kind, slot, str(err) or type(err).__name__)
+
+
+def _retry_leftovers(names: set[str] | None = None) -> None:
+    """Retry deleting remembered leftover slots (callers hold op_lock). A slot the registry
+    references again (the same key re-added) is live, not leftover, and is never deleted."""
+    with registry_txn(write=False) as reg:
+        leftovers = list(reg.get("leftovers", []))
+        live = {(e.get("store", "keyring"), secret_id(n, e)) for n, e in reg["keys"].items()}
+    settled = []
+    for item in leftovers:
+        if names is not None and item["name"] not in names:
+            continue
+        if (item["store"], item["slot"]) in live:
+            settled.append(item)
+            continue
+        try:
+            STORES[item["store"]].delete(item["slot"])
+            settled.append(item)
+        except Exception:
+            pass
+    if settled:
+        with registry_txn() as reg:
+            reg["leftovers"] = [i for i in reg.get("leftovers", []) if i not in settled]
+
+
 def entry(name: str) -> dict:
     with registry_txn(write=False) as reg:
         if name not in reg["keys"]:
@@ -634,8 +684,8 @@ def cmd_add(args) -> int:
         store = STORES["file" if args.file_store else "keyring"]
         sid = new_secret_id(name, fp)
         old_slot = (previous.get("store", "keyring"), secret_id(name, previous)) if previous else None
-        store.put(sid, value)  # staged: the registry still points at the old slot
         try:
+            store.put(sid, value)  # staged: the registry still points at the old slot
             with registry_txn() as reg:
                 e = reg["keys"].setdefault(name, {})
                 if e.get("fingerprint") != fp:  # a new key starts with a clean status
@@ -649,16 +699,16 @@ def cmd_add(args) -> int:
                 apply_probe(e, result, ref)
                 renews = e.get("renews_day")
         except BaseException:
-            if old_slot != (store.kind, sid):  # unstage; the old key and its record are untouched
-                with contextlib.suppress(Exception):
-                    store.delete(sid)
+            if old_slot != (store.kind, sid):
+                published = _published(name, sid)  # the registry write may have landed before the failure
+                if published is False:             # it didn't: unstage, the old key and record stand
+                    _discard_slot(name, store.kind, sid)
+                elif published is None:            # can't tell: keep it, and let a later run decide
+                    _remember_leftover(name, store.kind, sid, "couldn't confirm whether it was saved")
             raise
         if old_slot and old_slot != (store.kind, sid):  # the predecessor, now unreferenced
-            try:
-                STORES[old_slot[0]].delete(old_slot[1])
-            except Refused as err:
-                print(f"warning  couldn't delete the previous key from the {old_slot[0]} store ({err}); "
-                      "remove it by hand", file=sys.stderr)
+            _discard_slot(name, *old_slot)
+        _retry_leftovers({name})
     cleared = args.clipboard and not args.keep_clipboard and clear_clipboard_if(value)
     value = ""
     where = "your OS keychain" if store.kind == "keyring" else FileStore().path()
@@ -696,6 +746,10 @@ def cmd_list(args) -> int:
     if args.json:
         print(json.dumps(rows, indent=2))
         return 0
+    leftovers = reg.get("leftovers", [])
+    if leftovers:
+        print(f"note: {len(leftovers)} leftover key copies from interrupted runs; the next add or remove "
+              "retries deleting them", file=sys.stderr)
     if not rows:
         print("no keys yet. Run: claude-credits add")
         return 0
@@ -738,9 +792,14 @@ def cmd_check(args) -> int:
 
 
 def choose(verify: bool) -> str:
-    """The next key to spend, by `order`. With `verify`, test each candidate and skip (and
-    record) any that's exhausted or invalid; if none works, re-test the ones recorded as
-    exhausted before giving up, in case their credit has arrived."""
+    return choose_key(verify)[0]
+
+
+def choose_key(verify: bool) -> tuple[str, str | None]:
+    """The next key to spend, by `order`, and (when verified) the fingerprint of the exact
+    key that passed. With `verify`, test each candidate and skip (and record) any that's
+    exhausted or invalid; if none works, re-test the ones recorded as exhausted before
+    giving up, in case their credit has arrived."""
     ref = today()
     with registry_txn(write=False) as reg:
         keys = {n: dict(e) for n, e in reg["keys"].items()}
@@ -749,14 +808,14 @@ def choose(verify: bool) -> str:
                     key=lambda n: (days_left(keys[n], ref) is None, days_left(keys[n], ref) or 0, n))
     if not verify:
         if candidates:
-            return candidates[0]
+            return candidates[0], None
     else:
         for name in candidates + parked:
             result = probe_stored(name, keys[name])
             commit_probe(name, result, ref)
             # A live key may go ahead on an inconclusive test; a parked one needs a clear yes.
             if result["status"] == "ok" or (result["status"] == "unknown" and name not in parked):
-                return name
+                return name, result.get("fingerprint")
     raise Refused("no usable key: every stored key is exhausted, invalid or missing. Run: claude-credits check")
 
 
@@ -781,6 +840,7 @@ def cmd_exec(args) -> int:
         print("claude-credits: warning: on 2026-10-22 the credit refused every `claude -p` request "
               "(\"Credit balance is too low\"). It covers your own API calls and Managed Agents.", file=sys.stderr)
     resolved = resolve_command(cmd)
+    verified_fp = None
     if args.name:
         name = args.name
         if not args.no_verify:
@@ -792,11 +852,14 @@ def cmd_exec(args) -> int:
                     result["status"] != "ok" and recorded in ("exhausted", "invalid")):
                 raise Refused(f"{name!r}: {result['status']} ({result.get('detail', '')}), recorded as "
                               f"{recorded}. Pass --no-verify to run anyway.")
+            verified_fp = result.get("fingerprint")
     else:
-        name = choose(verify=not args.no_verify)
+        name, verified_fp = choose_key(verify=not args.no_verify)
     key = stored_key(name, entry(name))
     if key is None:
         raise Refused(f"{name!r} is missing from its store; add it again")
+    if verified_fp and fingerprint(key) != verified_fp:  # replaced between the test and now
+        raise Refused(f"the key for {name!r} was replaced while it was being tested; run the command again")
     with registry_txn() as reg:
         if name in reg["keys"]:
             reg["keys"][name]["last_used"] = now()
@@ -874,6 +937,7 @@ def cmd_remove(args) -> int:
             gone = False
         with registry_txn() as reg:
             reg["keys"].pop(args.name, None)
+        _retry_leftovers({args.name})
     print(f"removed {args.name}" + ("" if gone else " (the store had no copy, or couldn't be reached)"))
     print("note     this only deletes it here. To revoke the key itself, delete it at platform.claude.com > API keys.")
     return 0

@@ -881,3 +881,91 @@ def test_windows_lock_keeps_retrying_past_ten_seconds_of_contention(monkeypatch)
     fake.fails = 10 ** 9
     with pytest.raises(cc.Refused, match="still locked"):
         cc._win_lock(F(), fake, wait=1)
+
+
+# ---------- regressions from Sol package round 2 ----------
+
+def test_a_failure_after_publishing_keeps_the_published_key(env, monkeypatch):
+    """The registry write lands, then something fails before the lock is released."""
+    api, kr, pasted, tmp = env
+    _, k1 = add(env)
+    k2 = fake_key()
+    api.orgs[k2] = "org-1"
+    pasted["v"] = k2
+    real_txn = cc.registry_txn
+    state = {"armed": True}
+
+    @contextlib.contextmanager
+    def fail_after_write(write=True):
+        with real_txn(write) as reg:
+            yield reg
+        if write and state["armed"] and reg["keys"].get("default", {}).get("fingerprint") == cc.fingerprint(k2):
+            state["armed"] = False
+            raise KeyboardInterrupt
+    monkeypatch.setattr(cc, "registry_txn", fail_after_write)
+    assert cc.main(["add", "--replace"]) == 130                     # main reports the interrupt
+    monkeypatch.setattr(cc, "registry_txn", real_txn)
+    assert cc.stored_key("default", cc.entry("default")) == k2      # the registry's key still exists
+
+
+def test_a_staging_write_that_fails_its_readback_leaves_nothing_behind(env, monkeypatch):
+    api, kr, pasted, tmp = env
+    _, k1 = add(env)
+    k2 = fake_key()
+    api.orgs[k2] = "org-1"
+    pasted["v"] = k2
+    real_put = cc.STORES["keyring"].put
+
+    def write_then_fail(slot, value):
+        kr.items[("claude-credits", slot)] = value
+        raise cc.Refused("the keychain didn't return the key as written")
+    monkeypatch.setattr(cc.STORES["keyring"], "put", write_then_fail)
+    assert cc.main(["add", "--replace"]) == 2
+    assert list(kr.items.values()) == [k1]
+
+
+def test_a_leftover_that_cannot_be_deleted_is_remembered_and_cleared_by_remove(env, monkeypatch, capsys):
+    api, kr, pasted, tmp = env
+    _, k1 = add(env)
+    _, k2 = add(env, "default", "org-1", None, "--replace")   # predecessor deletion below fails
+    # simulate: the k1 slot survived its deletion attempt
+    old_slot = cc.new_secret_id("default", cc.fingerprint(k1))
+    kr.items[("claude-credits", old_slot)] = k1
+    with cc.registry_txn() as reg:
+        reg["leftovers"] = [{"name": "default", "store": "keyring", "slot": old_slot}]
+    assert cc.main(["list"]) == 0 and "leftover" in capsys.readouterr().err
+    assert cc.main(["remove", "default", "--yes"]) == 0
+    assert kr.items == {} and json.loads(registry_text(tmp)).get("leftovers") == []
+
+
+def test_a_leftover_that_is_live_again_is_never_deleted(env):
+    api, kr, pasted, tmp = env
+    _, k1 = add(env)
+    live = cc.entry("default")["secret_id"]
+    with cc.registry_txn() as reg:
+        reg["leftovers"] = [{"name": "default", "store": "keyring", "slot": live}]
+    with cc.op_lock():
+        cc._retry_leftovers({"default"})
+    assert cc.stored_key("default", cc.entry("default")) == k1
+    assert json.loads(registry_text(tmp))["leftovers"] == []
+
+
+def test_exec_refuses_a_key_replaced_between_its_test_and_launch(env, monkeypatch, capsys):
+    api, kr, pasted, tmp = env
+    _, k1 = add(env)
+    k2 = fake_key()
+    api.orgs[k2] = "org-other"
+    real_commit = cc.commit_probe
+
+    def replace_after_test(name, result, ref):
+        real_commit(name, result, ref)
+        sid = cc.new_secret_id(name, cc.fingerprint(k2))   # another organization's key lands now
+        kr.items[("claude-credits", sid)] = k2
+        with cc.registry_txn() as reg:
+            reg["keys"][name].update(secret_id=sid, fingerprint=cc.fingerprint(k2))
+    monkeypatch.setattr(cc, "commit_probe", replace_after_test)
+    ran = {}
+    monkeypatch.setattr(cc.os, "execve", lambda f, a, e: ran.update(env=e))
+    monkeypatch.setattr(cc.subprocess, "call", lambda a, env: ran.update(env=env) or 0)
+    assert cc.main(["exec", "--", sys.executable, "-c", "0"]) == 2 and not ran
+    assert "replaced while it was being tested" in capsys.readouterr().err
