@@ -57,7 +57,7 @@ def config_dir() -> str:
 API_BASE = os.environ.get("CLAUDE_CREDITS_API_BASE", "https://api.anthropic.com")
 ALLOWED_API_BASES = re.compile(r"https://api\.anthropic\.com|https?://(127\.0\.0\.1|localhost)(:\d+)?")
 PROBE_MODEL = os.environ.get("CLAUDE_CREDITS_PROBE_MODEL", "claude-haiku-5-5")
-KEYRING_SERVICE = "claude-credits"
+KEYRING_SERVICE = "claude-credits"  # plus the config folder, so separate homes never share slots
 TIMEOUT = 60
 DEFAULT_NAME = "default"
 LOCK_WAIT = 600  # seconds to wait for another claude-credits run to finish
@@ -125,6 +125,13 @@ def classify(value: str) -> str:
     raise Refused("that doesn't look like a Claude Console API key (expected sk-ant-usr-…)")
 
 
+def keyring_service() -> str:
+    """The keychain service for this config folder. Registries, locks and journals are per
+    folder (CLAUDE_CREDITS_HOME), so the keychain slots they manage must be too."""
+    home = os.path.realpath(config_dir())
+    return f"{KEYRING_SERVICE}/{hashlib.sha256(home.encode()).hexdigest()[:12]}"
+
+
 def fingerprint(value: str) -> str:
     """Short sha256 of a high-entropy key: enough to tell keys apart, useless for guessing one."""
     return "sha256:" + hashlib.sha256(value.encode()).hexdigest()[:16]
@@ -160,13 +167,13 @@ class KeyringStore:
 
     def get(self, name: str) -> str | None:
         with self._errors():
-            return self._kr().get_password(KEYRING_SERVICE, name)
+            return self._kr().get_password(keyring_service(), name)
 
     def put(self, name: str, value: str) -> None:
         with self._errors():
             kr = self._kr()
-            kr.set_password(KEYRING_SERVICE, name, value)
-            if kr.get_password(KEYRING_SERVICE, name) != value:
+            kr.set_password(keyring_service(), name, value)
+            if kr.get_password(keyring_service(), name) != value:
                 raise Refused("the keychain didn't return the key as written")
 
     def delete(self, name: str) -> bool:
@@ -177,12 +184,48 @@ class KeyringStore:
             kr = self._kr()
             from keyring.errors import PasswordDeleteError
             try:
-                kr.delete_password(KEYRING_SERVICE, name)
+                kr.delete_password(keyring_service(), name)
                 return True
             except PasswordDeleteError:
-                if kr.get_password(KEYRING_SERVICE, name) is None:
+                if kr.get_password(keyring_service(), name) is None:
                     return False
                 raise Refused("the OS keychain wouldn't delete the key (access denied?)")
+
+
+def _durable_write(path: str, text: str, prefix: str) -> None:
+    """Write `text` to `path` atomically and durably: a fresh 0600 temp file (mkstemp,
+    O_EXCL) in the same folder, fsynced, renamed over `path`, then the folder fsynced (on
+    POSIX), so the new contents survive a power cut before anything that depends on them."""
+    folder = os.path.dirname(path)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=prefix, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    if sys.platform != "win32":
+        dfd = os.open(folder, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+
+
+def _sweep_temp(prefix: str) -> None:
+    """Delete temp files a killed run left (callers hold the lock that guards their writes,
+    so any temp file found is abandoned). File-store temp files can hold keys."""
+    folder = config_dir()
+    with contextlib.suppress(FileNotFoundError):
+        for f in os.listdir(folder):
+            if f.startswith(prefix) and f.endswith(".tmp"):
+                with contextlib.suppress(OSError):
+                    os.unlink(os.path.join(folder, f))
 
 
 class FileStore:
@@ -204,28 +247,21 @@ class FileStore:
             return json.load(fh)
 
     def _save(self, data: dict) -> None:
-        os.makedirs(config_dir(), mode=0o700, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=config_dir(), prefix=".keys-", suffix=".tmp")  # 0600, O_EXCL
-        try:
-            with os.fdopen(fd, "w") as fh:
-                json.dump(data, fh)
-            os.replace(tmp, self.path())
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp)
-            raise
+        _durable_write(self.path(), json.dumps(data), ".keys-")
 
     def get(self, name: str) -> str | None:
         return self._load().get(name)
 
     def put(self, name: str, value: str) -> None:
         with _locked(os.path.join(config_dir(), "keys.lock")):
+            _sweep_temp(".keys-")
             data = self._load()
             data[name] = value
             self._save(data)
 
     def delete(self, name: str) -> bool:
         with _locked(os.path.join(config_dir(), "keys.lock")):
+            _sweep_temp(".keys-")
             data = self._load()
             if name not in data:
                 return False
@@ -319,11 +355,8 @@ def registry_txn(write: bool = True):
         before = json.dumps(reg, sort_keys=True)
         yield reg
         if write and json.dumps(reg, sort_keys=True) != before:
-            fd, tmp = tempfile.mkstemp(dir=config_dir(), prefix=".registry-", suffix=".tmp")
-            with os.fdopen(fd, "w") as fh:
-                json.dump(reg, fh, indent=2, sort_keys=True)
-                fh.write("\n")
-            os.replace(tmp, path)
+            _sweep_temp(".registry-")
+            _durable_write(path, json.dumps(reg, indent=2, sort_keys=True) + "\n", ".registry-")
 
 
 @contextlib.contextmanager
@@ -353,9 +386,9 @@ def journal_add(*items: dict) -> None:
 def reconcile(names: set[str] | None = None) -> list[tuple[dict, str, bool | None]]:
     """Settle the journal (callers hold op_lock): a slot an entry references (same store and
     slot) is live and is just dropped from the journal; any other is deleted, then dropped.
-    A delete that reports an error may still have landed, so the slot is looked up before
-    it counts as stuck. Returns the stuck ones as (item, reason, still_present), where
-    still_present is None if even the lookup failed; they stay journaled for the next run."""
+    A delete that reports an error stays journaled (it may or may not have landed; the
+    next run's delete settles it). Returns those as (item, reason, still_present), where
+    still_present comes from a lookup (None if that failed too) and only guides remove."""
     with registry_txn(write=False) as reg:
         journal = list(reg.get("journal", []))
         live = {(e.get("store", "keyring"), secret_id(n, e)) for n, e in reg["keys"].items()}
@@ -369,15 +402,12 @@ def reconcile(names: set[str] | None = None) -> list[tuple[dict, str, bool | Non
         try:
             STORES[item["store"]].delete(item["slot"])  # False (already absent) settles it too
             settled.append(item)
-        except Exception as err:
+        except Exception as err:  # it may or may not have landed: keep tracking it either way
             try:
                 present = STORES[item["store"]].get(item["slot"]) is not None
             except Exception:
                 present = None
-            if present is False:  # the delete landed after all
-                settled.append(item)
-            else:
-                failed.append((item, str(err) or type(err).__name__, present))
+            failed.append((item, str(err) or type(err).__name__, present))
     if settled:
         with registry_txn() as reg:
             reg["journal"] = [i for i in reg.get("journal", []) if i not in settled]
@@ -949,8 +979,8 @@ def cmd_remove(args) -> int:
         failed = reconcile({args.name})  # deletes the slot, now that nothing references it
         if e:
             stuck = [(why, present) for item, why, present in failed if item == slot]
-            gone = not stuck
-            if stuck and not args.force:
+            gone = not stuck or stuck[0][1] is False  # a lookup says it's gone; it stays journaled anyway
+            if stuck and stuck[0][1] is not False and not args.force:
                 why, present = stuck[0]
                 if present:  # confirmed still there: put things back as they were
                     with registry_txn() as reg:

@@ -1,14 +1,22 @@
-"""Fault injection: random add / replace / store-move / remove sequences, each crashed at a
-random point (a store read, write or delete, or a registry write, before or after it
-lands). After every step these must hold:
+"""Fault injection: random add / replace / store-move / remove / recovery sequences, each
+step failed at a random store or registry operation, in one of two ways:
 
-1. No untracked copies, even right after a crash: every slot in any store is either the
-   one a registry entry points to or listed in the journal.
-2. After the next clean run (reconcile), the journal is empty, every slot in any store is
-   live, and every entry points to a stored key whose fingerprint matches.
+- error: that one operation raises and the code's own error handling runs (finally
+  blocks, cleanup, rollback);
+- kill: the process dies there. Every later operation in that step fails too, so no
+  cleanup runs, as with a power cut or `kill -9`.
+
+Steps start from whatever the last one left (an unsettled journal, a half-finished
+replace), and recovery itself can be interrupted. After every step these must hold:
+
+1. No untracked copies: every slot in any store is either the one a registry entry points
+   to or listed in the journal.
+2. Every entry points to a stored key whose fingerprint matches.
 3. No lost or invented keys: a name holds the key it held before the step or the one the
    step was adding (or nothing, for a remove or a first add that didn't land), and a step
    that reported success holds exactly the new state.
+
+And after an uninterrupted recovery: the journal is empty and only live slots remain.
 """
 from __future__ import annotations
 
@@ -29,23 +37,27 @@ import claude_credits as cc  # noqa: E402
 
 ALPHABET = string.ascii_letters + string.digits + "-_"
 NAMES = ["a", "b"]
+faults = st.one_of(st.none(), st.tuples(st.integers(1, 24), st.booleans()))  # (operation number, kill?)
 
 
 class Crash(Exception):
-    """An injected failure: anything from a power cut to a keychain error mid-write."""
+    """An injected failure."""
 
 
 class Plan:
     def __init__(self):
-        self.fail_at, self.count = None, 0
+        self.arm(None)
 
-    def arm(self, fail_at):
-        self.fail_at, self.count = fail_at, 0
+    def arm(self, fault):
+        self.fail_at, self.kill = fault if fault else (None, False)
+        self.count, self.dead = 0, False
 
     def tick(self, where):
+        if self.dead:  # killed: nothing after the kill point happens
+            raise Crash(f"{where} (process gone)")
         self.count += 1
         if self.fail_at is not None and self.count == self.fail_at:
-            self.fail_at = None
+            self.fail_at, self.dead = None, self.kill
             raise Crash(where)
 
 
@@ -119,54 +131,46 @@ class Store(RuleBasedStateMachine):
         with self.saved["registry_txn"](write=False) as reg:
             return reg
 
-    def _run(self, argv, fail_at):
-        self.plan.arm(fail_at)
+    def _quietly(self, fn, fault):
+        self.plan.arm(fault)
         try:
             with open(os.devnull, "w") as null, contextlib.redirect_stdout(null), contextlib.redirect_stderr(null):
-                return cc.main(argv)
+                return fn()
         except Crash:
             return "crash"
         finally:
             self.plan.arm(None)
 
-    @rule(name=st.sampled_from(NAMES), k=st.integers(0, 3), store=st.sampled_from(["keyring", "file"]),
-          fail_at=st.one_of(st.none(), st.integers(1, 20)))
-    def add(self, name, k, store, fail_at):
+    @rule(name=st.sampled_from(NAMES), k=st.integers(0, 3), store=st.sampled_from(["keyring", "file"]), fault=faults)
+    def add(self, name, k, store, fault):
         key = self.keys[k]
         cc.read_key = lambda args, key=key: key
         before = self._registry()["keys"].get(name, {}).get("fingerprint")
-        rc = self._run(["add", name, "--replace"] + (["--file-store"] if store == "file" else []), fail_at)
+        argv = ["add", name, "--replace"] + (["--file-store"] if store == "file" else [])
+        rc = self._quietly(lambda: cc.main(argv), fault)
         if rc == 0:
             self.allowed[name] = {cc.fingerprint(key)}
-        elif rc == "crash" or rc == 130:
+        elif rc in ("crash", 130):
             self.allowed[name] = {before, cc.fingerprint(key)}
         else:  # refused (e.g. the key is stored under the other name): nothing may change
             self.allowed[name] = {before}
 
-    @rule(name=st.sampled_from(NAMES), fail_at=st.one_of(st.none(), st.integers(1, 14)))
-    def remove(self, name, fail_at):
+    @rule(name=st.sampled_from(NAMES), fault=faults)
+    def remove(self, name, fault):
         before = self._registry()["keys"].get(name, {}).get("fingerprint")
-        rc = self._run(["remove", name, "--yes"], fail_at)
-        if rc == 0:
-            self.allowed[name] = {None}
-        elif rc == "crash" or rc == 130:
-            self.allowed[name] = {before, None}
-        else:
-            self.allowed[name] = {before}
+        rc = self._quietly(lambda: cc.main(["remove", name, "--yes"]), fault)
+        self.allowed[name] = {None} if rc == 0 else {before, None}
 
-    @invariant()
-    def holds(self):
-        if not hasattr(self, "plan"):
-            return
-        self.plan.arm(None)
-        reg = self._registry()
-        live = {(e.get("store", "keyring"), cc.secret_id(n, e)) for n, e in reg["keys"].items()}
-        journaled = {(i["store"], i["slot"]) for i in reg.get("journal", [])}
-        # 1. right after the step, crash or not: nothing untracked
-        for kind, store in self.stores.items():
-            for slot in store.data:
-                assert (kind, slot) in live | journaled, f"untracked copy {kind}:{slot}"
-        # 2. after the next clean run: journal settled, only live slots, entries consistent
+    @rule(fault=faults)
+    def recover(self, fault):
+        """A later run's recovery, possibly interrupted itself."""
+        def run():
+            with cc.op_lock():
+                cc.reconcile()
+        self._quietly(run, fault)
+
+    @rule()
+    def recover_cleanly(self):
         with cc.op_lock():
             assert cc.reconcile() == []
         reg = self._registry()
@@ -174,15 +178,25 @@ class Store(RuleBasedStateMachine):
         live = {(e.get("store", "keyring"), cc.secret_id(n, e)) for n, e in reg["keys"].items()}
         for kind, store in self.stores.items():
             assert {(kind, s) for s in store.data} <= live, f"orphan in {kind}: {set(store.data)}"
-        for n, e in reg["keys"].items():
+
+    @invariant()
+    def holds(self):
+        if not hasattr(self, "plan"):
+            return
+        reg = self._registry()
+        live = {(e.get("store", "keyring"), cc.secret_id(n, e)) for n, e in reg["keys"].items()}
+        journaled = {(i["store"], i["slot"]) for i in reg.get("journal", [])}
+        for kind, store in self.stores.items():  # 1. nothing untracked
+            for slot in store.data:
+                assert (kind, slot) in live | journaled, f"untracked copy {kind}:{slot}"
+        for n, e in reg["keys"].items():  # 2. every entry points at its key
             value = self.stores[e.get("store", "keyring")].data.get(cc.secret_id(n, e))
             assert value is not None and cc.fingerprint(value) == e["fingerprint"], f"{n} points at a bad slot"
-        # 3. no lost or invented keys
-        for n in NAMES:
+        for n in NAMES:  # 3. no lost or invented keys
             actual = reg["keys"].get(n, {}).get("fingerprint")
             assert actual in self.allowed[n], f"{n} holds {actual}, expected one of {self.allowed[n]}"
             self.allowed[n] = {actual}
 
 
-Store.TestCase.settings = settings(max_examples=300, stateful_step_count=25, deadline=None)
+Store.TestCase.settings = settings(max_examples=300, stateful_step_count=30, deadline=None)
 TestFaultInjection = Store.TestCase

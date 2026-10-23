@@ -66,13 +66,13 @@ class MemoryKeyring(keyring.backend.KeyringBackend):
 def kr_value(kr, name):
     """The value stored for `name` (slots are `name#<fingerprint>`, or plain `name` for old entries)."""
     vals = [v for (svc, user), v in kr.items.items()
-            if svc == "claude-credits" and (user == name or user.startswith(name + "#"))]
+            if svc == cc.keyring_service() and (user == name or user.startswith(name + "#"))]
     assert len(vals) <= 1, f"more than one stored copy of {name}: {len(vals)}"
     return vals[0] if vals else None
 
 
 def kr_slot(kr, name):
-    return next(k for k in kr.items if k[0] == "claude-credits" and (k[1] == name or k[1].startswith(name + "#")))
+    return next(k for k in kr.items if k[0] == cc.keyring_service() and (k[1] == name or k[1].startswith(name + "#")))
 
 
 # ---------- keys ----------
@@ -917,7 +917,7 @@ def test_a_staging_write_that_fails_its_readback_leaves_nothing_behind(env, monk
     real_put = cc.STORES["keyring"].put
 
     def write_then_fail(slot, value):
-        kr.items[("claude-credits", slot)] = value
+        kr.items[(cc.keyring_service(), slot)] = value
         raise cc.Refused("the keychain didn't return the key as written")
     monkeypatch.setattr(cc.STORES["keyring"], "put", write_then_fail)
     assert cc.main(["add", "--replace"]) == 2
@@ -929,7 +929,7 @@ def test_a_journaled_copy_is_reported_and_cleared_by_remove(env, capsys):
     _, k1 = add(env)
     _, k2 = add(env, "default", "org-1", None, "--replace")
     old_slot = cc.new_secret_id("default", cc.fingerprint(k1))
-    kr.items[("claude-credits", old_slot)] = k1                  # a delete that didn't happen
+    kr.items[(cc.keyring_service(), old_slot)] = k1                  # a delete that didn't happen
     with cc.registry_txn() as reg:
         reg["journal"] = [cc._slot("default", "keyring", old_slot)]
     assert cc.main(["list"]) == 0 and "old key copies" in capsys.readouterr().err
@@ -951,7 +951,7 @@ def test_a_journaled_slot_that_is_live_is_never_deleted(env):
 
 def test_remove_cleans_up_a_name_that_only_has_journaled_copies(env, capsys):
     api, kr, pasted, tmp = env
-    kr.items[("claude-credits", "ghost#abc")] = fake_key()
+    kr.items[(cc.keyring_service(), "ghost#abc")] = fake_key()
     with cc.registry_txn() as reg:
         reg["journal"] = [cc._slot("ghost", "keyring", "ghost#abc")]
     assert cc.main(["remove", "ghost", "--yes"]) == 0
@@ -1006,7 +1006,7 @@ def test_exec_no_verify_refuses_a_key_replaced_after_selection(env, monkeypatch,
     def choose_then_replace(verify):
         picked = real_choose(verify)
         sid = cc.new_secret_id("default", cc.fingerprint(k2))
-        kr.items[("claude-credits", sid)] = k2
+        kr.items[(cc.keyring_service(), sid)] = k2
         with cc.registry_txn() as reg:
             reg["keys"]["default"].update(secret_id=sid, fingerprint=cc.fingerprint(k2))
         return picked
@@ -1027,7 +1027,7 @@ def test_exec_refuses_a_key_replaced_between_its_test_and_launch(env, monkeypatc
     def replace_after_test(name, result, ref):
         real_commit(name, result, ref)
         sid = cc.new_secret_id(name, cc.fingerprint(k2))   # another organization's key lands now
-        kr.items[("claude-credits", sid)] = k2
+        kr.items[(cc.keyring_service(), sid)] = k2
         with cc.registry_txn() as reg:
             reg["keys"][name].update(secret_id=sid, fingerprint=cc.fingerprint(k2))
     monkeypatch.setattr(cc, "commit_probe", replace_after_test)
@@ -1036,3 +1036,56 @@ def test_exec_refuses_a_key_replaced_between_its_test_and_launch(env, monkeypatc
     monkeypatch.setattr(cc.subprocess, "call", lambda a, env: ran.update(env=env) or 0)
     assert cc.main(["exec", "--", sys.executable, "-c", "0"]) == 2 and not ran
     assert "replaced while it was being tested" in capsys.readouterr().err
+
+
+# ---------- regressions from Sol package round 4 ----------
+
+def test_abandoned_file_store_temp_files_are_swept(env):
+    api, kr, pasted, tmp = env
+    cfg = tmp / "cfg"
+    cfg.mkdir(parents=True, exist_ok=True)
+    stale = cfg / ".keys-abandoned.tmp"
+    stale.write_text('{"x": "sk-ant-usr-leftover"}')
+    add(env, "srv", "org-f", None, "--file-store")
+    assert not stale.exists()
+
+
+def test_registry_and_file_store_writes_are_fsynced(env, monkeypatch):
+    synced = []
+    real = os.fsync
+    monkeypatch.setattr(cc.os, "fsync", lambda fd: (synced.append(fd), real(fd))[1])
+    add(env, "srv", "org-f", None, "--file-store")
+    assert len(synced) >= 2 * (2 if os.name == "posix" else 1)   # file (+ folder) per durable write
+
+
+def test_separate_config_folders_never_share_keychain_slots(env, monkeypatch, tmp_path):
+    api, kr, pasted, tmp = env
+    key = fake_key()
+    api.orgs[key] = "org-1"
+    pasted["v"] = key
+    assert cc.main(["add"]) == 0                                   # home 1
+    monkeypatch.setenv("CLAUDE_CREDITS_HOME", str(tmp_path / "home2"))
+    assert cc.main(["add"]) == 0                                   # home 2, same key, same name
+    assert cc.main(["remove", "default", "--yes"]) == 0            # removed from home 2 only
+    monkeypatch.setenv("CLAUDE_CREDITS_HOME", str(tmp / "cfg"))
+    assert cc.stored_key("default", cc.entry("default")) == key    # home 1 still has its key
+
+
+def test_an_errored_delete_stays_journaled_even_if_a_lookup_says_it_is_gone(env, monkeypatch):
+    api, kr, pasted, tmp = env
+
+    class Lying:
+        kind = "keyring"
+
+        def delete(self, slot):
+            raise cc.Refused("access denied")
+
+        def get(self, slot):
+            return None   # claims it's gone
+
+    monkeypatch.setitem(cc.STORES, "keyring", Lying())
+    with cc.registry_txn() as reg:
+        reg["journal"] = [cc._slot("x", "keyring", "x#1")]
+    with cc.op_lock():
+        failed = cc.reconcile()
+    assert failed and json.loads(registry_text(tmp))["journal"] == [cc._slot("x", "keyring", "x#1")]
