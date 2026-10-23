@@ -1089,3 +1089,46 @@ def test_an_errored_delete_stays_journaled_even_if_a_lookup_says_it_is_gone(env,
     with cc.op_lock():
         failed = cc.reconcile()
     assert failed and json.loads(registry_text(tmp))["journal"] == [cc._slot("x", "keyring", "x#1")]
+
+
+# ---------- regressions from Sol package round 5 ----------
+
+def test_a_temp_file_that_cannot_be_swept_keeps_the_delete_tracked(env, monkeypatch):
+    api, kr, pasted, tmp = env
+    add(env, "srv", "org-f", None, "--file-store")
+    cfg = tmp / "cfg"
+    stuck = cfg / ".keys-stuck.tmp"
+    stuck.write_text('{"x": "sk-ant-usr-leftover"}')
+    real_unlink = cc.os.unlink
+
+    def sharing_violation(path, *a, **k):
+        if str(path).endswith(".keys-stuck.tmp"):
+            raise PermissionError(13, "in use by another process")
+        return real_unlink(path, *a, **k)
+    monkeypatch.setattr(cc.os, "unlink", sharing_violation)
+    assert cc.main(["remove", "srv", "--yes"]) == 2                    # refused, not "removed"
+    assert stuck.exists() and "srv" in json.loads(registry_text(tmp))["keys"]
+    monkeypatch.setattr(cc.os, "unlink", real_unlink)
+    assert cc.main(["remove", "srv", "--yes"]) == 0 and not stuck.exists()
+
+
+def test_an_access_denied_keyring_delete_is_refused_not_absent(env):
+    api, kr, pasted, tmp = env
+    add(env)
+
+    class Denied(MemoryKeyring):
+        def delete_password(self, s, u):
+            raise keyring.errors.PasswordDeleteError("access denied")
+    d = Denied()
+    d.items = kr.items
+    keyring.set_keyring(d)
+    with pytest.raises(cc.Refused, match="wouldn't delete"):
+        cc.STORES["keyring"].delete(cc.entry("default")["secret_id"])
+
+
+def test_durable_writes_use_the_platform_durable_rename(env, monkeypatch):
+    calls = []
+    real = cc._replace_durably
+    monkeypatch.setattr(cc, "_replace_durably", lambda t, p: (calls.append(p), real(t, p))[1])
+    add(env, "srv", "org-f", None, "--file-store")
+    assert any(p.endswith("keys.json") for p in calls) and any(p.endswith("registry.json") for p in calls)

@@ -178,8 +178,11 @@ class KeyringStore:
 
     def delete(self, name: str) -> bool:
         """True if deleted, False if it wasn't there. keyring reports every failed delete
-        (absent, access denied, ...) as PasswordDeleteError, so absence is confirmed by a
-        lookup before it's believed."""
+        (absent, access denied, ...) as PasswordDeleteError, so the item is looked up: still
+        there means the delete failed (Refused, and the journal keeps it); not there means
+        it was absent. That lookup is trusted. On macOS, PasswordDeleteError is also how an
+        absent item is reported, so without trusting the keychain's own read no delete of
+        an absent item could ever settle; a keychain whose reads lie defeats any client."""
         with self._errors():
             kr = self._kr()
             from keyring.errors import PasswordDeleteError
@@ -192,10 +195,31 @@ class KeyringStore:
                 raise Refused("the OS keychain wouldn't delete the key (access denied?)")
 
 
+def _replace_durably(tmp: str, path: str) -> None:
+    """Rename `tmp` over `path` so the rename itself survives a power cut: on POSIX by
+    fsyncing the folder afterwards, on Windows with MoveFileExW(MOVEFILE_WRITE_THROUGH),
+    which returns only once the move is flushed to disk."""
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+        move = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
+        move.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+        move.restype = wintypes.BOOL
+        if not move(tmp, path, 0x1 | 0x8):  # MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+            raise ctypes.WinError(ctypes.get_last_error())
+        return
+    os.replace(tmp, path)
+    dfd = os.open(os.path.dirname(path), os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
 def _durable_write(path: str, text: str, prefix: str) -> None:
     """Write `text` to `path` atomically and durably: a fresh 0600 temp file (mkstemp,
-    O_EXCL) in the same folder, fsynced, renamed over `path`, then the folder fsynced (on
-    POSIX), so the new contents survive a power cut before anything that depends on them."""
+    O_EXCL) in the same folder, fsynced, then renamed over `path` durably, so the new
+    contents survive a power cut before anything that depends on them."""
     folder = os.path.dirname(path)
     os.makedirs(folder, mode=0o700, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=folder, prefix=prefix, suffix=".tmp")
@@ -204,28 +228,32 @@ def _durable_write(path: str, text: str, prefix: str) -> None:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        _replace_durably(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
-    if sys.platform != "win32":
-        dfd = os.open(folder, os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
 
 
 def _sweep_temp(prefix: str) -> None:
     """Delete temp files a killed run left (callers hold the lock that guards their writes,
-    so any temp file found is abandoned). File-store temp files can hold keys."""
+    so any temp file found is abandoned). File-store temp files can hold keys, so one that
+    can't be deleted is an error: the operation fails, and its journal entry stays for the
+    next run to retry."""
     folder = config_dir()
-    with contextlib.suppress(FileNotFoundError):
-        for f in os.listdir(folder):
-            if f.startswith(prefix) and f.endswith(".tmp"):
-                with contextlib.suppress(OSError):
-                    os.unlink(os.path.join(folder, f))
+    try:
+        names = os.listdir(folder)
+    except FileNotFoundError:
+        return
+    for f in names:
+        if f.startswith(prefix) and f.endswith(".tmp"):
+            try:
+                os.unlink(os.path.join(folder, f))
+            except FileNotFoundError:
+                pass
+            except OSError as err:
+                raise Refused(f"couldn't delete a leftover temp file {f} ({err.strerror or err}); "
+                              "it may hold a key")
 
 
 class FileStore:
