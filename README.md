@@ -164,5 +164,12 @@ uv run --no-project --with pytest --with hypothesis --with keyring pytest -q
 CLAUDE_CREDITS_REAL_KEYRING=1 uv run --no-project --with pytest --with hypothesis --with keyring pytest -q -k real_keyring
 ```
 
-The tests run against a fake API and an in-memory keychain. The second command also
-round-trips a dummy key through your real keychain and deletes it.
+The tests run against a fake API and an in-memory keychain. `tests/test_fault_injection.py`
+runs random add, replace, store-move and remove sequences, crashes each step at a random
+point, and checks three things:
+
+- no copy of a key is ever left untracked;
+- every record points to a stored key that matches;
+- no key is lost or invented.
+
+The second command also round-trips a dummy key through your real keychain and deletes it.

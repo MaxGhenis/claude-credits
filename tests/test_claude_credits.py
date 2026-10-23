@@ -924,30 +924,97 @@ def test_a_staging_write_that_fails_its_readback_leaves_nothing_behind(env, monk
     assert list(kr.items.values()) == [k1]
 
 
-def test_a_leftover_that_cannot_be_deleted_is_remembered_and_cleared_by_remove(env, monkeypatch, capsys):
+def test_a_journaled_copy_is_reported_and_cleared_by_remove(env, capsys):
     api, kr, pasted, tmp = env
     _, k1 = add(env)
-    _, k2 = add(env, "default", "org-1", None, "--replace")   # predecessor deletion below fails
-    # simulate: the k1 slot survived its deletion attempt
+    _, k2 = add(env, "default", "org-1", None, "--replace")
     old_slot = cc.new_secret_id("default", cc.fingerprint(k1))
-    kr.items[("claude-credits", old_slot)] = k1
+    kr.items[("claude-credits", old_slot)] = k1                  # a delete that didn't happen
     with cc.registry_txn() as reg:
-        reg["leftovers"] = [{"name": "default", "store": "keyring", "slot": old_slot}]
-    assert cc.main(["list"]) == 0 and "leftover" in capsys.readouterr().err
+        reg["journal"] = [cc._slot("default", "keyring", old_slot)]
+    assert cc.main(["list"]) == 0 and "old key copies" in capsys.readouterr().err
     assert cc.main(["remove", "default", "--yes"]) == 0
-    assert kr.items == {} and json.loads(registry_text(tmp)).get("leftovers") == []
+    assert kr.items == {} and json.loads(registry_text(tmp))["journal"] == []
 
 
-def test_a_leftover_that_is_live_again_is_never_deleted(env):
+def test_a_journaled_slot_that_is_live_is_never_deleted(env):
     api, kr, pasted, tmp = env
     _, k1 = add(env)
     live = cc.entry("default")["secret_id"]
     with cc.registry_txn() as reg:
-        reg["leftovers"] = [{"name": "default", "store": "keyring", "slot": live}]
+        reg["journal"] = [cc._slot("default", "keyring", live)]
     with cc.op_lock():
-        cc._retry_leftovers({"default"})
+        assert cc.reconcile({"default"}) == []
     assert cc.stored_key("default", cc.entry("default")) == k1
-    assert json.loads(registry_text(tmp))["leftovers"] == []
+    assert json.loads(registry_text(tmp))["journal"] == []
+
+
+def test_remove_cleans_up_a_name_that_only_has_journaled_copies(env, capsys):
+    api, kr, pasted, tmp = env
+    kr.items[("claude-credits", "ghost#abc")] = fake_key()
+    with cc.registry_txn() as reg:
+        reg["journal"] = [cc._slot("ghost", "keyring", "ghost#abc")]
+    assert cc.main(["remove", "ghost", "--yes"]) == 0
+    assert kr.items == {} and "cleaned up 1" in capsys.readouterr().out
+
+
+def test_moving_the_same_key_between_stores_leaves_no_untracked_copy(env, monkeypatch):
+    api, kr, pasted, tmp = env
+    _, key = add(env, "k", "org-m")                              # keyring
+    real_put = cc.FileStore.put
+
+    def write_then_fail(self, slot, value):
+        real_put(self, slot, value)
+        raise cc.Refused("read-back failed")
+    monkeypatch.setattr(cc.FileStore, "put", write_then_fail)
+    pasted["v"] = key
+    assert cc.main(["add", "k", "--replace", "--file-store"]) == 2
+    monkeypatch.setattr(cc.FileStore, "put", real_put)
+    keys_file = tmp / "cfg" / "keys.json"
+    assert not keys_file.exists() or json.loads(keys_file.read_text()) == {}   # destination copy cleaned
+    assert cc.stored_key("k", cc.entry("k")) == key                             # source still serves
+
+
+def test_an_interrupt_after_publishing_does_not_strand_the_predecessor(env, monkeypatch):
+    api, kr, pasted, tmp = env
+    _, k1 = add(env)
+    k2 = fake_key()
+    api.orgs[k2] = "org-1"
+    pasted["v"] = k2
+    real_txn = cc.registry_txn
+    state = {"armed": True}
+
+    @contextlib.contextmanager
+    def fail_after_publish(write=True):
+        with real_txn(write) as reg:
+            yield reg
+        if write and state["armed"] and reg["keys"].get("default", {}).get("fingerprint") == cc.fingerprint(k2):
+            state["armed"] = False
+            raise KeyboardInterrupt
+    monkeypatch.setattr(cc, "registry_txn", fail_after_publish)
+    assert cc.main(["add", "--replace"]) == 130
+    monkeypatch.setattr(cc, "registry_txn", real_txn)
+    assert list(kr.items.values()) == [k2]                       # predecessor gone, replacement kept
+
+
+def test_exec_no_verify_refuses_a_key_replaced_after_selection(env, monkeypatch, capsys):
+    api, kr, pasted, tmp = env
+    _, k1 = add(env)
+    k2 = fake_key()
+    real_choose = cc.choose_key
+
+    def choose_then_replace(verify):
+        picked = real_choose(verify)
+        sid = cc.new_secret_id("default", cc.fingerprint(k2))
+        kr.items[("claude-credits", sid)] = k2
+        with cc.registry_txn() as reg:
+            reg["keys"]["default"].update(secret_id=sid, fingerprint=cc.fingerprint(k2))
+        return picked
+    monkeypatch.setattr(cc, "choose_key", choose_then_replace)
+    ran = {}
+    monkeypatch.setattr(cc.os, "execve", lambda f, a, e: ran.update(env=e))
+    monkeypatch.setattr(cc.subprocess, "call", lambda a, env: ran.update(env=env) or 0)
+    assert cc.main(["exec", "--no-verify", "--", sys.executable, "-c", "0"]) == 2 and not ran
 
 
 def test_exec_refuses_a_key_replaced_between_its_test_and_launch(env, monkeypatch, capsys):
