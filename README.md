@@ -112,11 +112,57 @@ won't pay for (above), not only for an empty balance.
 `list` then shows the key as exhausted until your renewal day. If it ran out on the
 renewal day itself, it's re-tested the next day. The examples print the command for you.
 
-## Keep it yours
+## Keep your key yours
 
 Anthropic's [credit terms](https://www.anthropic.com/legal/credit-terms) let credits be
-used only by the holder of the account and forbid transferring them. Use your key for
-your own work, and don't give it to anyone else.
+used only by the holder of the account and forbid transferring them. Don't send your key
+to anyone. To let a teammate use part of your credit, invite them into your organization
+instead (next section).
+
+## Share your credit with a teammate
+
+If you won't use all of your credit, a teammate can use part of it with their own key, in
+your organization, under a monthly cap you set. Anthropic's
+[help center](https://support.claude.com/en/articles/17154008-monthly-api-credits-for-max-and-team-plans)
+describes this setup: everyone with an API key in the linked organization draws from the
+same balance, and workspace spend limits cap what a project or teammate can use.
+
+**You (the plan holder)** do this in the [Console](https://platform.claude.com), in the
+organization you linked to your plan. You're its Admin if you created it.
+
+1. **Create a workspace for them.** Settings > Workspaces > Create workspace.
+2. **Cap it.** Select the workspace > Spend limits > Monthly limit > Change limit, and
+   set how much of your monthly credit they may use (say $100 of $200). The Default
+   Workspace can't take a limit, so use the new one.
+3. **Invite them with the User role.** Settings > Members > + Invite, enter their email,
+   choose **User**, Send Invites. The invite lasts three weeks. A User can't see or create
+   API keys outside the workspaces you add them to, so they can't bypass the cap.
+4. **Give them that workspace.** Once they've accepted: Settings > Members >
+   Add to workspace, then pick the workspace, them, and **Workspace Developer**. That role
+   can create API keys in that workspace.
+
+**Your teammate** signs in to the Console with the invited email and switches to your
+organization. They open API keys, choose your workspace, create a key, and store it:
+
+```bash
+claude-credits add yourname --renews-day 17   # your plan's renewal day
+```
+
+What each side gets:
+
+- Your key never leaves your machine.
+- Their spending stops at the cap. Requests then fail with "You have reached your
+  specified workspace API usage limits", which `claude-credits` treats as used up and
+  re-tests daily.
+- Spending shows on the Console's Cost page. You can lower the cap, or remove them from
+  the organization, at any time.
+- What you don't share stays yours, and your own keys (in another workspace) keep working
+  until the whole credit runs out.
+
+Anthropic's docs say workspace roles add permissions on top of the organization role, but
+they don't spell out this exact combination. If the Console won't let your teammate create
+a key in the workspace, change their organization role to Developer. In that case, check
+on the API keys page that their key sits in the capped workspace.
 
 ## How it keeps the key safe
 

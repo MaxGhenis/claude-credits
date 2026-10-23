@@ -72,6 +72,9 @@ NOT_A_CONSOLE_KEY = {
 }
 NAME_RE = re.compile(r"[A-Za-z0-9._@+-]{1,64}")
 EXHAUSTED_MARK = "credit balance is too low"
+# A workspace spend limit (how a plan holder caps a teammate) answers 400 with this instead.
+# Anthropic doesn't document when a workspace limit resets, so it's re-checked daily.
+WORKSPACE_LIMIT_MARK = "workspace api usage limits"
 STRIP_ENV = ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL",
              "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
 EXAMPLES = ("hello.py", "batch.py")
@@ -611,6 +614,8 @@ def probe(key: str, spend: bool = True) -> dict:
     text = error_text(payload)
     if EXHAUSTED_MARK in text.lower():
         return {**out, "status": "exhausted", "detail": text}
+    if WORKSPACE_LIMIT_MARK in text.lower():
+        return {**out, "status": "exhausted", "detail": text, "limit": "workspace"}
     if status == 401:
         return {**out, "status": "invalid", "detail": text}
     if status == 429:
@@ -630,6 +635,8 @@ def apply_probe(e: dict, result: dict, ref: dt.date) -> None:
     if result["status"] == "unknown" and e.get("status") in ("ok", "exhausted", "invalid"):
         return  # a free or failed check says nothing about the balance: keep what was known
     set_status(e, result["status"], ref)
+    if result.get("limit") == "workspace":  # the plan holder's cap, not the plan's renewal
+        e["status_until"] = (ref + dt.timedelta(days=1)).isoformat()
 
 
 def probe_stored(name: str, e: dict, spend: bool = True) -> dict:

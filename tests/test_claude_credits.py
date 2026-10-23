@@ -1132,3 +1132,24 @@ def test_durable_writes_use_the_platform_durable_rename(env, monkeypatch):
     monkeypatch.setattr(cc, "_replace_durably", lambda t, p: (calls.append(p), real(t, p))[1])
     add(env, "srv", "org-f", None, "--file-store")
     assert any(p.endswith("keys.json") for p in calls) and any(p.endswith("registry.json") for p in calls)
+
+
+# ---------- workspace spend limits (sharing a credit with a teammate) ----------
+
+def test_a_workspace_spend_limit_counts_as_used_up_and_is_rechecked_daily(env, monkeypatch):
+    api, kr, pasted, tmp = env
+    _, key = add(env, "share", "org-1", None, "--renews-day", "17")
+    real = api.http
+
+    def capped(method, path, k, body=None):
+        if method == "POST" and k == key:
+            return 400, {"anthropic-organization-id": "org-1"}, {"error": {
+                "type": "invalid_request_error",
+                "message": "You have reached your specified workspace API usage limits. "
+                           "You will regain access on 2026-11-01 at 00:00 UTC."}}
+        return real(method, path, k, body)
+    monkeypatch.setattr(cc, "http", capped)
+    assert cc.main(["check"]) == 1
+    e = reg_key(tmp, "share")
+    assert (e["status"], e["status_until"]) == ("exhausted", "2026-10-23")   # not the Nov 17 renewal
+    assert cc.main(["pick", "--verify"]) == 2
