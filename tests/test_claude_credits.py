@@ -1132,3 +1132,94 @@ def test_durable_writes_use_the_platform_durable_rename(env, monkeypatch):
     monkeypatch.setattr(cc, "_replace_durably", lambda t, p: (calls.append(p), real(t, p))[1])
     add(env, "srv", "org-f", None, "--file-store")
     assert any(p.endswith("keys.json") for p in calls) and any(p.endswith("registry.json") for p in calls)
+
+
+# ---------- workspace spend limits (sharing a credit with a teammate) ----------
+
+def test_a_workspace_spend_limit_counts_as_used_up_and_is_rechecked_daily(env, monkeypatch):
+    api, kr, pasted, tmp = env
+    _, key = add(env, "share", "org-1", None, "--renews-day", "17")
+    real = api.http
+
+    def capped(method, path, k, body=None):
+        if method == "POST" and k == key:
+            return 400, {"anthropic-organization-id": "org-1"}, {"error": {
+                "type": "invalid_request_error",
+                "message": "You have reached your specified workspace API usage limits. "
+                           "You will regain access on 2026-11-01 at 00:00 UTC."}}
+        return real(method, path, k, body)
+    monkeypatch.setattr(cc, "http", capped)
+    assert cc.main(["check"]) == 1
+    e = reg_key(tmp, "share")
+    assert (e["status"], e["status_until"]) == ("exhausted", "2026-10-23")   # not the Nov 17 renewal
+    assert cc.main(["pick", "--verify"]) == 2
+
+
+def test_a_capped_key_keeps_its_daily_recheck_after_set_renews_day_and_comes_back(env, monkeypatch):
+    """The review's sequence: a capped key added without a renewal day, then `set
+    --renews-day` as `add` advises. The re-check stays the next day, and on that day the key
+    is offered again and used once the plan holder has raised the cap."""
+    api, kr, pasted, tmp = env
+    real, capped_keys = api.http, set()
+
+    def capped(method, path, k, body=None):
+        if method == "POST" and k in capped_keys:
+            return 400, {"anthropic-organization-id": api.orgs[k]}, {"error": {
+                "type": "invalid_request_error",
+                "message": "You have reached your specified workspace API usage limits. "
+                           "You will regain access on 2026-11-01 at 00:00 UTC."}}
+        return real(method, path, k, body)
+    monkeypatch.setattr(cc, "http", capped)
+    key = fake_key()
+    capped_keys.add(key)
+    add(env, "share", "org-1", key)
+    e = reg_key(tmp, "share")
+    assert (e["status"], e["status_until"]) == ("exhausted", "2026-10-23")
+    assert cc.main(["set", "share", "--renews-day", "17"]) == 0
+    assert reg_key(tmp, "share")["status_until"] == "2026-10-23"     # not moved to the Nov 17 renewal
+    assert cc.main(["pick"]) == 2                     # still parked today
+
+    capped_keys.clear()                               # the cap is raised overnight
+    monkeypatch.setattr(cc, "today", lambda: REF + dt.timedelta(days=1))
+    assert cc.main(["pick"]) == 0                     # offered again without a test
+    assert cc.main(["pick", "--verify"]) == 0
+    e = reg_key(tmp, "share")
+    assert e["status"] == "ok" and not {"status_until", "exhausted_seen", "exhausted_by"} & e.keys()
+
+
+def test_an_end_given_by_hand_survives_a_renewal_day_change(env):
+    _, _, _, tmp = env
+    add(env, "held", "org-1")
+    add(env, "spent", "org-2")
+    assert cc.main(["mark", "held", "exhausted", "--force", "--until", "2026-11-05"]) == 0
+    assert cc.main(["mark", "spent", "exhausted", "--force"]) == 0
+    for name in ("held", "spent"):
+        assert cc.main(["set", name, "--renews-day", "17"]) == 0
+    assert reg_key(tmp, "held")["status_until"] == "2026-11-05"
+    assert reg_key(tmp, "spent")["status_until"] == "2026-11-17"     # the credit follows the renewal
+
+
+@given(dates, st.sampled_from(["credit", "workspace", "hand"]),
+       st.lists(st.one_of(st.none(), st.integers(1, 31)), min_size=1, max_size=4))
+def test_only_a_credit_exhaustion_follows_the_renewal_day(seen, by, days):
+    """Invariants: a credit exhaustion always ends where `exhausted_until` puts it for the
+    current renewal day, and after the day it was seen; a workspace limit ends the next day
+    and an end given by hand stays put, whatever the renewal day becomes; clearing the
+    status leaves none of it behind."""
+    e = {}
+    cc.set_status(e, "exhausted", seen, by="workspace" if by == "workspace" else "credit")
+    if by == "hand":
+        cc.hold_until(e, (seen + dt.timedelta(days=9)).isoformat())
+    first = e["status_until"]
+    if by == "workspace":
+        assert first == (seen + dt.timedelta(days=1)).isoformat()
+    for day in days:
+        e["renews_day"] = day
+        cc.renewal_changed(e)
+        if by == "credit":
+            assert e["status_until"] == cc.exhausted_until(e, seen)
+            assert dt.date.fromisoformat(e["status_until"]) > seen
+        else:
+            assert e["status_until"] == first
+    cc.set_status(e, "ok", seen)
+    assert not {"status_until", "exhausted_seen", "exhausted_by"} & e.keys()

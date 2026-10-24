@@ -48,9 +48,9 @@ else:
                 **params, messages=[{"role": "user", "content": prompt}]))
             for i, prompt in enumerate(prompts, 1)])
     except anthropic.BadRequestError as e:
-        if "credit balance is too low" in str(e).lower():
+        if "credit balance is too low" in str(e).lower() or "workspace api usage limits" in str(e).lower():
             name = os.environ.get("CLAUDE_CREDITS_NAME", "default")
-            sys.exit(f"Anthropic says this plan's credit is used up. Run: claude-credits mark {name} exhausted")
+            sys.exit(f"Anthropic says this credit (or your share of it) is used up. Run: claude-credits mark {name} exhausted")
         raise
     batch_id = batch.id
     print(f"submitted {len(prompts)} prompts as batch {batch_id}", file=sys.stderr)
