@@ -131,15 +131,16 @@ same balance, and workspace spend limits cap what a project or teammate can use.
 organization you linked to your plan. You're its Admin if you created it.
 
 1. **Create a workspace for them.** Settings > Workspaces > Create workspace.
-2. **Cap it.** Select the workspace > Spend limits > Monthly limit > Change limit, and
-   set how much of your monthly credit they may use (say $100 of $200). The Default
-   Workspace can't take a limit, so use the new one.
+2. **Cap it.** Select the workspace > Spend limits > Monthly limit > Change limit (how
+   much to set is below). The Default Workspace can't take a limit, so use the new one.
 3. **Invite them with the User role.** Settings > Members > + Invite, enter their email,
    choose **User**, Send Invites. The invite lasts three weeks. A User can't see or create
-   API keys outside the workspaces you add them to, so they can't bypass the cap.
+   API keys outside the workspaces you add them to. Don't make them a Developer: that role
+   can create keys in the Default Workspace, which has no cap.
 4. **Give them that workspace.** Once they've accepted: Settings > Members >
-   Add to workspace, then pick the workspace, them, and **Workspace Developer**. That role
-   can create API keys in that workspace.
+   Add to workspace, then pick the workspace, them, and **Workspace Developer**. Anthropic's
+   [workspace docs](https://platform.claude.com/docs/en/manage-claude/workspaces#workspace-roles-and-permissions)
+   let an organization User hold that role, which can create API keys in that workspace.
 
 **Your teammate** signs in to the Console with the invited email and switches to your
 organization. They open API keys, choose your workspace, create a key, and store it:
@@ -148,21 +149,29 @@ organization. They open API keys, choose your workspace, create a key, and store
 claude-credits add yourname --renews-day 17   # your plan's renewal day
 ```
 
-What each side gets:
+**How much to set.** The cap counts spending by calendar month and resets on the 1st, but
+your credit renews on your billing day
+([Anthropic's guide](https://platform.claude.com/docs/en/about-claude/api-credits-for-subscribers#spend-limits-and-rate-limits)).
+Unless your plan renews on the 1st, each cycle's credit spans two calendar months, so your
+teammate can spend up to twice the cap from it. With a renewal on the 17th, a $100 cap
+allows $100 from the 17th to the 31st and another $100 from the 1st to the 16th: all of a
+$200 credit. To be sure of keeping part of every credit, set the cap to half of what
+you'd share per cycle.
+
+What the cap covers, and what it doesn't:
 
 - Your key never leaves your machine.
-- Their spending stops at the cap. Requests then fail with "You have reached your
-  specified workspace API usage limits", which `claude-credits` treats as used up and
-  re-tests daily.
+- Their key stops at the cap. Requests then fail with "You have reached your specified
+  workspace API usage limits", which `claude-credits` treats as used up and re-tests
+  daily, since you can raise the cap at any time.
+- The cap doesn't cover the Console's Playground. Anthropic's
+  [role docs](https://support.claude.com/en/articles/10186004-claude-console-roles-and-permissions)
+  let every role use it, User included, and it spends the same credit. Access to the
+  Default Workspace, which can't take a limit, follows the organization role, so Playground
+  use there isn't capped. Share with people you trust.
 - Spending shows on the Console's Cost page. You can lower the cap, or remove them from
   the organization, at any time.
-- What you don't share stays yours, and your own keys (in another workspace) keep working
-  until the whole credit runs out.
-
-Anthropic's docs say workspace roles add permissions on top of the organization role, but
-they don't spell out this exact combination. If the Console won't let your teammate create
-a key in the workspace, change their organization role to Developer. In that case, check
-on the API keys page that their key sits in the capped workspace.
+- Your own keys keep working until the whole credit runs out, whoever spends it.
 
 ## How it keeps the key safe
 

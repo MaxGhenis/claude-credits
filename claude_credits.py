@@ -73,7 +73,8 @@ NOT_A_CONSOLE_KEY = {
 NAME_RE = re.compile(r"[A-Za-z0-9._@+-]{1,64}")
 EXHAUSTED_MARK = "credit balance is too low"
 # A workspace spend limit (how a plan holder caps a teammate) answers 400 with this instead.
-# Anthropic doesn't document when a workspace limit resets, so it's re-checked daily.
+# The error says when access resumes (spend limits run by calendar month, not the plan's
+# billing cycle), but the plan holder can raise the limit sooner, so it's re-checked daily.
 WORKSPACE_LIMIT_MARK = "workspace api usage limits"
 STRIP_ENV = ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL",
              "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
@@ -489,9 +490,10 @@ def exhausted_until(e: dict, seen: dt.date) -> str:
     """How long an exhaustion seen on `seen` holds: until the plan's next renewal, when new
     credit arrives. On the renewal day itself the new credit may not have landed yet (the
     time of day isn't documented), and with no renewal day known there's no date to wait
-    for, so both re-check the next day."""
+    for, so both re-check the next day. So does a workspace spend limit, which the plan
+    holder can raise at any time."""
     day = e.get("renews_day")
-    if day:
+    if day and e.get("exhausted_by") != "workspace":
         nxt = renewal_on_or_after(day, seen)
         if nxt > seen:
             return nxt.isoformat()
@@ -522,20 +524,29 @@ def order(keys: dict, ref: dt.date) -> list[str]:
     return sorted(usable, key=key)
 
 
-def set_status(e: dict, status: str, ref: dt.date) -> None:
+def set_status(e: dict, status: str, ref: dt.date, by: str = "credit") -> None:
+    """`by` records what ran out: "credit" (the plan's balance, back at renewal) or
+    "workspace" (a spend limit the plan holder set). `hold_until` records "hand"."""
     e["status"] = status
     if status == "exhausted":
         e["exhausted_seen"] = ref.isoformat()
+        e["exhausted_by"] = by
         e["status_until"] = exhausted_until(e, ref)
     else:
-        e.pop("status_until", None)
-        e.pop("exhausted_seen", None)
+        for k in ("status_until", "exhausted_seen", "exhausted_by"):
+            e.pop(k, None)
+
+
+def hold_until(e: dict, until: str) -> None:
+    """An exhaustion end given by hand, which a later renewal-day change leaves alone."""
+    e["status_until"], e["exhausted_by"] = until, "hand"
 
 
 def renewal_changed(e: dict) -> None:
     """Recompute a recorded exhaustion's end after the renewal day changes, from the day
-    the exhaustion was seen (later unrelated checks don't move it)."""
-    if e.get("status") == "exhausted":
+    the exhaustion was seen (later unrelated checks don't move it). Only the plan's credit
+    follows the renewal day: a workspace limit and an end given by hand keep theirs."""
+    if e.get("status") == "exhausted" and e.get("exhausted_by", "credit") == "credit":
         seen = e.get("exhausted_seen") or (e.get("last_check") or "")[:10]
         if seen:
             e["status_until"] = exhausted_until(e, dt.date.fromisoformat(seen))
@@ -634,9 +645,7 @@ def apply_probe(e: dict, result: dict, ref: dt.date) -> None:
         e["rate_limits"] = result["rate_limits"]
     if result["status"] == "unknown" and e.get("status") in ("ok", "exhausted", "invalid"):
         return  # a free or failed check says nothing about the balance: keep what was known
-    set_status(e, result["status"], ref)
-    if result.get("limit") == "workspace":  # the plan holder's cap, not the plan's renewal
-        e["status_until"] = (ref + dt.timedelta(days=1)).isoformat()
+    set_status(e, result["status"], ref, by=result.get("limit", "credit"))
 
 
 def probe_stored(name: str, e: dict, spend: bool = True) -> dict:
@@ -766,7 +775,8 @@ def cmd_add(args) -> int:
                         if old not in journal:
                             journal.append(old)
                 if e.get("fingerprint") != fp:  # a new key starts with a clean status
-                    for k in ("status", "status_until", "exhausted_seen", "last_used", "org_id", "rate_limits"):
+                    for k in ("status", "status_until", "exhausted_seen", "exhausted_by", "last_used",
+                              "org_id", "rate_limits"):
                         e.pop(k, None)
                 e.update({"store": store.kind, "secret_id": sid, "kind": kind, "fingerprint": fp,
                           "added": e.get("added") or now(), "updated": now()})
@@ -976,9 +986,9 @@ def cmd_mark(args) -> int:
             apply_probe(k, result, ref)
             if result["status"] == "unknown":  # the test itself failed: take your word for a day
                 set_status(k, "exhausted", ref)
-                k["status_until"] = (ref + dt.timedelta(days=1)).isoformat()
+                hold_until(k, (ref + dt.timedelta(days=1)).isoformat())
             if args.until and k.get("status") == "exhausted":
-                k["status_until"] = args.until
+                hold_until(k, args.until)
             status = k["status"]
         print(f"{args.name}: {status} ({result.get('detail', '')})")
         return 0
@@ -989,7 +999,7 @@ def cmd_mark(args) -> int:
         set_status(k, args.state, ref)
         k["last_check_detail"] = "marked by hand"
         if args.state == "exhausted" and args.until:
-            k["status_until"] = args.until
+            hold_until(k, args.until)
     print(f"{args.name}: {args.state}")
     return 0
 
