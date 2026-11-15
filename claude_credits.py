@@ -78,7 +78,7 @@ EXHAUSTED_MARK = "credit balance is too low"
 WORKSPACE_LIMIT_MARK = "workspace api usage limits"
 STRIP_ENV = ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL",
              "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
-EXAMPLES = ("hello.py", "batch.py")
+EXAMPLES = ("hello.py", "batch.py", "review.py")
 
 
 class Refused(Exception):

@@ -601,7 +601,7 @@ def test_exec_refuses_a_missing_command_before_touching_the_key(env, capsys):
 def test_examples_are_copied_into_a_folder(env, tmp_path):
     dest = tmp_path / "ex"
     assert cc.main(["examples", str(dest)]) == 0
-    assert sorted(os.listdir(dest)) == ["batch.py", "hello.py"]
+    assert sorted(os.listdir(dest)) == ["batch.py", "hello.py", "review.py"]
     (dest / "hello.py").write_text("mine")
     assert cc.main(["examples", str(dest)]) == 0 and (dest / "hello.py").read_text() == "mine"
 
