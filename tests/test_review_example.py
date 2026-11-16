@@ -30,8 +30,8 @@ def message(content=None, stop="end_turn", model="claude-fable-5-2", usage=None,
 
 
 class FakeStream:
-    def __init__(self, msg):
-        self.msg, self.request_id = msg, "req_fake123"
+    def __init__(self, msg, raises=None, during=None):
+        self.msg, self.raises, self.during, self.request_id = msg, raises, during, "req_fake123"
 
     def __enter__(self):
         return self
@@ -40,11 +40,17 @@ class FakeStream:
         return False
 
     def get_final_message(self):
+        if self.during:
+            self.during()
+        if self.raises is not None:
+            raise self.raises
         return self.msg
 
 
 class FakeClient:
-    def __init__(self, msg=None, counted=1000, raises=None):
+    """raises: an exception when the stream opens; mid_stream: one while it streams."""
+
+    def __init__(self, msg=None, counted=1000, raises=None, mid_stream=None, during=None):
         self.calls, self.retries = [], []
         outer = self
 
@@ -59,14 +65,22 @@ class FakeClient:
                 outer.calls.append(("stream", kw))
                 if raises is not None:
                     raise raises
-                return FakeStream(msg if msg is not None else message())
+                return FakeStream(msg if msg is not None else message(), mid_stream, during)
+
+        class Unretried:      # what with_options(max_retries=0) returns
+            beta = SimpleNamespace(messages=BetaMessages())
+
+        class RetryingBeta:   # the client's own retrying path must not carry the paid call
+            def stream(self, **kw):
+                raise AssertionError("the paid call went through the retrying client")
 
         self.messages = Messages()
-        self.beta = SimpleNamespace(messages=BetaMessages())
+        self.beta = SimpleNamespace(messages=RetryingBeta())
+        self._unretried = Unretried()
 
     def with_options(self, **kw):
         self.retries.append(kw.get("max_retries"))
-        return self
+        return self._unretried
 
     def kinds(self):
         return [k for k, _ in self.calls]
@@ -109,7 +123,8 @@ def test_writes_the_review_with_tokens_and_cost(work):
     assert "VERDICT: APPROVE" in md and "Written by: claude-fable-5-2" in md and "WARNING" not in md
     assert rec["cost_usd"] == pytest.approx((1000 * 8 + 500 * 40) / 1e6)  # $0.028
     assert "$0.0280" in md and rec["request_id"] == "req_fake123" and not rec["fell_back"]
-    assert rec["account"] == "me@example.org" and "me@example.org" in md
+    # The account stays in the local record, out of the review text people may paste.
+    assert rec["account"] == "me@example.org" and "me@example.org" not in md
     assert [i["kind"] for i in rec["inputs"]] == ["brief", "file", "diff"]
     assert b"\r\n" not in (work / "out.md").read_bytes()
 
@@ -214,6 +229,8 @@ def test_context_window_uses_the_margin(work):
     ("sk_live_" + "c" * 24, [], True),
     ("AIza" + "d" * 35, [], True),
     ("npm_" + "e" * 36, [], True),
+    ("sk-" + "f" * 48, [], True),
+    ("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N", [], True),
     ("mentions sk-ant- prefixes in prose", [], False),
 ])
 def test_secret_guard_stops_before_any_call(work, planted, flag, refused):
@@ -333,6 +350,15 @@ def test_fallback_without_itemized_usage_reports_unknowns(work):
     assert rec["attempts"][-1]["model"] is None and "unreported attempt (unreported)" in md
 
 
+def test_itemized_fallback_without_a_model_name(work):
+    usage = {"input_tokens": 1, "output_tokens": 1, "iterations": [
+        {"type": "message", "input_tokens": 1000, "output_tokens": 300}]}
+    content = [SimpleNamespace(type="fallback"), text("VERDICT: APPROVE")]
+    go(work, FakeClient(message(usage=usage, content=content)), str(work / "a.py"))
+    md, rec = outputs(work)
+    assert rec["fell_back"] and rec["served_model"] is None and "Written by: unknown" in md
+
+
 def test_dated_snapshot_is_not_a_fallback(work):
     msg = message(model="claude-fable-5-2-20261101")
     code, _ = go(work, FakeClient(msg), str(work / "a.py"))
@@ -383,6 +409,57 @@ def test_unwritable_out_is_refused_before_paying(work):
     assert client.calls == []
 
 
+def test_the_record_failing_after_the_review_is_written(work, monkeypatch):
+    real = review._atomic_write
+    def json_fails(path, text):
+        if path.endswith(".json"):
+            raise OSError(28, "No space left on device")
+        real(path, text)
+    monkeypatch.setattr(review, "_atomic_write", json_fails)
+    code, err = go(work, FakeClient(), str(work / "a.py"))
+    assert code == 6 and '"cost_usd": 0.028' in go.stdout
+
+
+def test_any_error_after_paying_still_saves_the_text(work, monkeypatch):
+    def broken(*a):
+        raise TypeError("an unexpected response shape")
+    monkeypatch.setattr(review, "usage_rows", broken)
+    code, err = go(work, FakeClient(), str(work / "a.py"))
+    assert code == 6 and "TypeError" in err and "VERDICT: APPROVE" in go.stdout
+
+
+def test_the_rescue_writes_utf8_whatever_stdout_is(work, monkeypatch):
+    monkeypatch.setattr(review, "_atomic_write", lambda p, t: (_ for _ in ()).throw(PermissionError(13, "locked")))
+    raw = io.BytesIO()
+    cp1252 = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
+    args = review.parser().parse_args(["--brief", str(work / "brief.md"), "--out", str(work / "out.md"),
+                                       str(work / "a.py")])
+    msg = message(content=[text("VERDICT: APPROVE \u2192 fine \u2264 1")])
+    code = review.run(args, FakeClient(msg), env={"ANTHROPIC_API_KEY": JOB_KEY}, err=io.StringIO(),
+                      out=cp1252, clock=iter([0.0, 1.0]).__next__)
+    assert code == 6 and "\u2192 fine \u2264".encode("utf-8") in raw.getvalue()
+
+
+def test_an_out_file_that_appears_during_the_request(work):
+    client = FakeClient(during=lambda: (work / "out.md").write_text("another run's review"))
+    code, err = go(work, client, str(work / "a.py"))
+    assert code == 6 and (work / "out.md").read_text() == "another run's review"
+    assert "VERDICT: APPROVE" in go.stdout
+
+
+def test_a_read_only_target_is_refused_before_paying(work):
+    target = work / "out.md"
+    target.write_text("old")
+    target.chmod(0o444)
+    client = FakeClient()
+    try:
+        with pytest.raises(review.Refused, match="can't replace"):
+            go(work, client, str(work / "a.py"), "--overwrite")
+    finally:
+        target.chmod(0o644)
+    assert client.calls == []
+
+
 def test_a_write_failure_after_paying_prints_the_review(work, monkeypatch):
     def broken(path, text):
         raise PermissionError(13, "Permission denied")
@@ -411,8 +488,10 @@ def test_inputs(work):
             go(work, FakeClient(), str(work / bad))
     with pytest.raises(review.Refused, match="nothing to review"):
         go(work, FakeClient())
-    with pytest.raises(review.Refused, match="only one of --brief and --diff"):
+    with pytest.raises(review.Refused, match="only one input can read stdin"):
         go(work, FakeClient(), "--diff", "-", brief="-")
+    with pytest.raises(review.Refused, match="only one input can read stdin"):
+        go(work, FakeClient(), "-", "--diff", "-")
     code, _ = go(work, FakeClient(), "--diff", "-", stdin_bytes=b"--- a\n+++ b\n")
     assert code == 0 and outputs(work)[1]["inputs"][1]["name"] == "(stdin)"
 
@@ -425,6 +504,14 @@ def test_utf16_and_crlf_inputs(work):
     content = client.calls[-1][1]["messages"][0]["content"]
     assert content[0]["source"]["data"] == "1  one\n2  two"
     assert content[1]["source"]["data"].startswith("--- a")
+
+
+def test_line_numbers_follow_newlines_only(work):
+    (work / "ff.py").write_text("one\f\ntwo\u2028still two\nthree\n")
+    client = FakeClient()
+    go(work, client, str(work / "ff.py"))
+    data = client.calls[-1][1]["messages"][0]["content"][0]["source"]["data"]
+    assert data.split("\n") == ["1  one\f", "2  two\u2028still two", "3  three"]
 
 
 def test_price_lookup():
@@ -471,20 +558,23 @@ class FakeSDK:
         return self._client
 
 
-class LostConnection(Exception):
+class LostConnection(Exception):   # stands in for the HTTP library's read errors
     pass
 
 
-@pytest.mark.parametrize("exc, code, says", [
-    (FakeSDK.APIStatusError(400, "Your credit balance is too low"), 5, "used up"),
-    (FakeSDK.APIStatusError(529, "Overloaded"), 5, "overloaded"),
-    (FakeSDK.APIConnectionError("down"), 5, "the request failed"),
-    (LostConnection("mid-stream"), 5, "may still be billed"),
+@pytest.mark.parametrize("client_kw, code, says", [
+    ({"raises": FakeSDK.APIStatusError(400, "Your credit balance is too low")}, 5, "used up"),
+    ({"raises": FakeSDK.APIStatusError(529, "Overloaded")}, 5, "nothing was billed"),
+    ({"raises": FakeSDK.APIConnectionError("down")}, 5, "before streaming began"),
+    # Once the stream is open, any failure may already be billed, whatever its class.
+    ({"mid_stream": LostConnection("connection reset")}, 5, "may still be billed"),
+    ({"mid_stream": FakeSDK.APIStatusError(529, "overloaded_error event")}, 5, "may still be billed"),
+    ({"mid_stream": KeyboardInterrupt()}, 130, "interrupted"),
 ])
-def test_main_maps_errors_to_exit_codes(work, monkeypatch, capsys, exc, code, says):
+def test_main_maps_errors_to_exit_codes(work, monkeypatch, capsys, client_kw, code, says):
     monkeypatch.setenv("ANTHROPIC_API_KEY", JOB_KEY)
     argv = ["--brief", str(work / "brief.md"), "--out", str(work / "out.md"), str(work / "a.py")]
-    rc = review.main(argv, sdk=FakeSDK(FakeClient(raises=exc)), transport_errors=(LostConnection,))
+    rc = review.main(argv, sdk=FakeSDK(FakeClient(**client_kw)))
     assert rc == code and says in capsys.readouterr().err
     assert not (work / "out.md").exists()
 
@@ -494,7 +584,7 @@ def test_main_refusals_exit_2(work, monkeypatch, capsys):
     for extra in (["--max-tokens", "0"], ["--cap", "nan"]):
         argv = ["--brief", str(work / "brief.md"), "--out", str(work / "out.md"), str(work / "a.py"), *extra]
         client = FakeClient()
-        assert review.main(argv, sdk=FakeSDK(client), transport_errors=()) == 2
+        assert review.main(argv, sdk=FakeSDK(client)) == 2
         assert client.calls == []
 
 

@@ -26,11 +26,12 @@ fallbacks off.
 The credential screen is best-effort: it stops the job's own key and common token shapes,
 not every secret. Exit codes: 0 complete, 2 refused before sending, 3 declined, 4 stopped
 early or empty, 5 API or network error, 6 paid but the files couldn't be written (the
-review then goes to stdout).
+review then goes to stdout as UTF-8), 130 interrupted.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -59,7 +60,9 @@ CACHE_WRITE, CACHE_READ = 1.25, 0.10  # multiples of the input price
 MODELS = ("claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5")
 # Each model's permitted fallbacks, in the order they're tried, as the Models API lists
 # them (allowed_fallback_models, read 2026-11-15). The request names these explicitly, so
-# the cap prices exactly the models that can run. Haiku 5.5 has none.
+# the cap prices exactly the models that can run; the API accepted this list form for Fable
+# 5.2 on 2026-11-15. Haiku 5.5 has none. After a fallback, anthropic 2.8.0's stream
+# accumulator sets the message's model from the fallback block and copies usage.iterations.
 FALLBACK_TARGETS = {
     "claude-fable-5-2": ("claude-opus-4-8", "claude-opus-5"),
     "claude-opus-5-5": ("claude-opus-4-8", "claude-opus-5"),
@@ -88,7 +91,8 @@ nothing worth fixing, say so plainly. The brief may change any of this."""
 # Shapes of common credentials. A match stops the request before anything is sent.
 SECRET_PATTERNS = (
     ("an Anthropic API key or token", re.compile(r"sk-ant-[a-z]+\d*-[A-Za-z0-9_\-]{16,}")),
-    ("an OpenAI key", re.compile(r"\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_\-]{20,}")),
+    ("an OpenAI key", re.compile(r"\bsk-(?:(?:proj|svcacct|admin)-[A-Za-z0-9_\-]{20,}|[A-Za-z0-9]{40,}\b)")),
+    ("a JSON Web Token", re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}")),
     ("a private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----")),
     ("a GitHub token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})")),
     ("an AWS access key id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
@@ -101,6 +105,14 @@ SECRET_PATTERNS = (
 
 class Refused(Exception):
     """Stopped before anything was sent."""
+
+
+class StreamFailed(Exception):
+    """The request was accepted, then failed while the review was streaming."""
+
+    def __init__(self, original: BaseException):
+        super().__init__(f"{type(original).__name__}: {original}")
+        self.original = original
 
 
 @dataclass
@@ -146,14 +158,17 @@ def read_text(path: str, kind: str, stdin) -> Material:
 
 
 def numbered(text: str) -> str:
-    lines = text.splitlines()
+    # Split on newlines only, so form feeds and Unicode line separators don't shift numbers.
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
     width = len(str(len(lines)))
     return "\n".join(f"{i:>{width}}  {line}" for i, line in enumerate(lines, 1))
 
 
 def load_inputs(args, stdin) -> tuple[Material, list[Material]]:
-    if args.brief == "-" and args.diff == "-":
-        raise Refused("only one of --brief and --diff can read stdin")
+    if [args.brief, args.diff, *args.files].count("-") > 1:
+        raise Refused("only one input can read stdin (-)")
     brief = read_text(args.brief, "brief", stdin)
     materials = [read_text(p, "file", stdin) for p in args.files]
     if args.diff:
@@ -184,8 +199,14 @@ def check_writable(out: str, overwrite: bool) -> None:
     for p in (out, out + ".json"):
         if os.path.isdir(p):
             raise Refused(f"{p} is a folder")
-        if os.path.exists(p) and not overwrite:
-            raise Refused(f"{p} exists; pass --overwrite to replace it")
+        if os.path.exists(p):
+            if not overwrite:
+                raise Refused(f"{p} exists; pass --overwrite to replace it")
+            try:
+                with open(p, "ab"):
+                    pass
+            except OSError as e:
+                raise Refused(f"can't replace {p}: {e.strerror or e}") from None
     try:
         fd, probe = tempfile.mkstemp(prefix=".review-write-test-", dir=folder)
         os.close(fd)
@@ -378,11 +399,44 @@ def run(args, client, *, stdin=None, env=None, clock=time.monotonic, now=None, e
 
     started = clock()
     # No SDK retries on the paid call: a retried request could be billed twice, past the cap.
-    with client.with_options(max_retries=0).beta.messages.stream(**params) as stream:
-        message = stream.get_final_message()
+    # Errors while opening the stream (status codes, connection) pass through as they are;
+    # anything after that is a StreamFailed, since output may already have been billed.
+    with contextlib.ExitStack() as stack:
+        stream = stack.enter_context(client.with_options(max_retries=0).beta.messages.stream(**params))
+        try:
+            message = stream.get_final_message()
+        except Exception as e:
+            raise StreamFailed(e) from e
         request_id = getattr(stream, "request_id", None)
     seconds = clock() - started
+    try:
+        raw_text = review_text(message)[0]
+    except Exception:
+        raw_text = ""
+    try:
+        return report(args, message, request_id, seconds, counts, worst, allowed, fallback,
+                      brief, materials, env, now, err, out)
+    except Exception as e:
+        print(f"review: paid, but the review couldn't be saved ({type(e).__name__}: {e}); "
+              "its text follows on stdout", file=err)
+        rescue(out, raw_text + "\n")
+        return 6
 
+
+def rescue(out, text: str) -> None:
+    """Write paid-for text to stdout as UTF-8 bytes, whatever stdout's encoding is."""
+    data = text.encode("utf-8", "backslashreplace")
+    buf = getattr(out, "buffer", None)
+    if buf is not None:
+        out.flush()
+        buf.write(data)
+        buf.flush()
+    else:
+        out.write(data.decode("utf-8"))
+
+
+def report(args, message, request_id, seconds, counts, worst, allowed, fallback,
+           brief, materials, env, now, err, out) -> int:
     rows, itemized = usage_rows(message, args.model)
     text, saw_switch, dropped_partial = review_text(message)
     iter_fallback = any(r["type"] == "fallback_message" for r in rows)
@@ -392,8 +446,8 @@ def run(args, client, *, stdin=None, env=None, clock=time.monotonic, now=None, e
     if fell_back and not itemized:
         rows.append({"model": None, "type": "unreported", "input_tokens": 0, "output_tokens": 0,
                      "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "cost_usd": None})
-        if (price_key(served) or served) == args.model:
-            served = None
+    if fell_back and (price_key(served) or served) == args.model:
+        served = None   # a fallback ran, so the requested model didn't write the text
     known = [r["cost_usd"] for r in rows if r["cost_usd"] is not None]
     cost = sum(known) if len(known) == len(rows) else None
     strays = sorted({str(r["model"]) for r in rows if r["model"] and (price_key(r["model"]) or r["model"]) not in allowed})
@@ -441,8 +495,6 @@ def run(args, client, *, stdin=None, env=None, clock=time.monotonic, now=None, e
         f"- Attempts: {attempts}",
         f"- Request id: {request_id or 'not given'}",
     ]
-    if account:
-        header.append(f"- Paid from the credit of: {account}")
     header.append("- Inputs: " + ", ".join(f"{m.title} (sha256 {m.sha256[:12]})" for m in [brief, *materials]))
     header.append(f"- Finished: {when}, after {seconds:.0f} s")
     document = "\n".join(header) + "\n\n---\n\n" + body + ("\n" if body and not body.endswith("\n") else "")
@@ -461,12 +513,16 @@ def run(args, client, *, stdin=None, env=None, clock=time.monotonic, now=None, e
     }
     record_text = json.dumps(record, indent=2) + "\n"
     try:
+        if not args.overwrite:   # appeared while the request ran, say from a second run
+            for p in (args.out, args.out + ".json"):
+                if os.path.exists(p):
+                    raise FileExistsError(17, "appeared during the request", p)
         _atomic_write(args.out, document)
         _atomic_write(args.out + ".json", record_text)
     except OSError as e:
         print(f"review: paid, but couldn't write {args.out} ({e.strerror or e}); "
               "the review and its record follow on stdout", file=err)
-        out.write(document + "\n" + record_text)
+        rescue(out, document + "\n" + record_text)
         return 6
     print(f"{status} Written by {writer}; {inp:,} in, {outp:,} out; "
           + (f"${cost:.4f}" if cost is not None else "cost unknown") + f"; {args.out}", file=err)
@@ -494,28 +550,29 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: list[str] | None = None, *, sdk=None, transport_errors=None) -> int:
+def main(argv: list[str] | None = None, *, sdk=None) -> int:
     args = parser().parse_args(argv)
     if sdk is None:
         import anthropic as sdk  # imported here so the tests run without the SDK
-    if transport_errors is None:
-        try:
-            import httpx2  # the SDK's HTTP library; a connection lost mid-stream raises its errors
-            transport_errors = (httpx2.HTTPError,)
-        except ImportError:
-            transport_errors = ()
     client = sdk.Anthropic(max_retries=2, timeout=1800.0)
     try:
         return run(args, client)
     except Refused as e:
         print(f"review: {e}", file=sys.stderr)
         return 2
+    except StreamFailed as e:
+        print(f"review: the request failed while the review was streaming ({e}); nothing was "
+              "written, and it may still be billed for what it produced.", file=sys.stderr)
+        return 5
+    except KeyboardInterrupt:
+        print("review: interrupted; a request already sent may still be billed.", file=sys.stderr)
+        return 130
     except sdk.APIStatusError as e:
         print(f"review: {api_error_message(e.status_code, str(e))}", file=sys.stderr)
         return 5
-    except (sdk.APIError, *transport_errors) as e:
-        print(f"review: the request failed ({type(e).__name__}); nothing was written. A request "
-              "cut off mid-stream may still be billed for what it produced.", file=sys.stderr)
+    except sdk.APIError as e:
+        print(f"review: the request failed before streaming began ({type(e).__name__}); "
+              "nothing was written.", file=sys.stderr)
         return 5
 
 
