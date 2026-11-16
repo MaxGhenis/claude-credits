@@ -14,6 +14,7 @@ review = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(review)
 
 JOB_KEY = "sk-ant-api03-" + "Q" * 40 + "-jobkeyAA"   # stands in for the key exec sets
+FABLE_ATTEMPTS = ["claude-fable-5-2", "claude-opus-4-8", "claude-opus-5"]
 
 
 def text(t):
@@ -43,25 +44,35 @@ class FakeStream:
 
 
 class FakeClient:
-    def __init__(self, msg=None, counted=1000):
-        self.calls = []
+    def __init__(self, msg=None, counted=1000, raises=None):
+        self.calls, self.retries = [], []
         outer = self
 
         class Messages:
             def count_tokens(self, **kw):
                 outer.calls.append(("count", kw))
-                return SimpleNamespace(input_tokens=counted)
+                n = counted(kw["model"]) if callable(counted) else counted
+                return SimpleNamespace(input_tokens=n)
 
         class BetaMessages:
             def stream(self, **kw):
                 outer.calls.append(("stream", kw))
+                if raises is not None:
+                    raise raises
                 return FakeStream(msg if msg is not None else message())
 
         self.messages = Messages()
         self.beta = SimpleNamespace(messages=BetaMessages())
 
+    def with_options(self, **kw):
+        self.retries.append(kw.get("max_retries"))
+        return self
+
     def kinds(self):
         return [k for k, _ in self.calls]
+
+    def counted_models(self):
+        return [kw["model"] for k, kw in self.calls if k == "count"]
 
 
 @pytest.fixture
@@ -72,13 +83,14 @@ def work(tmp_path):
     return tmp_path
 
 
-def go(work, client, *extra, env=None, stdin_bytes=b""):
+def go(work, client, *extra, env=None, stdin_bytes=b"", out=None, brief=None):
     args = review.parser().parse_args(
-        ["--brief", str(work / "brief.md"), "--out", str(work / "out.md"), *extra])
-    err = io.StringIO()
+        ["--brief", brief or str(work / "brief.md"), "--out", out or str(work / "out.md"), *extra])
+    err, stdout = io.StringIO(), io.StringIO()
     env = {"ANTHROPIC_API_KEY": JOB_KEY, "CLAUDE_CREDITS_ACCOUNT": "me@example.org"} if env is None else env
     code = review.run(args, client, stdin=SimpleNamespace(buffer=io.BytesIO(stdin_bytes)), env=env,
-                      err=err, clock=iter([0.0, 12.0]).__next__)
+                      err=err, out=stdout, clock=iter([0.0, 12.0]).__next__)
+    go.stdout = stdout.getvalue()
     return code, err.getvalue()
 
 
@@ -91,22 +103,26 @@ def outputs(work):
 def test_writes_the_review_with_tokens_and_cost(work):
     client = FakeClient()
     code, err = go(work, client, str(work / "a.py"), "--diff", str(work / "change.diff"))
-    assert code == 0 and client.kinds() == ["count", "stream"]
+    assert code == 0 and client.kinds() == ["count", "count", "count", "stream"]
+    assert client.counted_models() == FABLE_ATTEMPTS and client.retries == [0]
     md, rec = outputs(work)
-    assert "VERDICT: APPROVE" in md and "Written by: claude-fable-5-2" in md
+    assert "VERDICT: APPROVE" in md and "Written by: claude-fable-5-2" in md and "WARNING" not in md
     assert rec["cost_usd"] == pytest.approx((1000 * 8 + 500 * 40) / 1e6)  # $0.028
-    assert "$0.0280" in md and rec["request_id"] == "req_fake123"
+    assert "$0.0280" in md and rec["request_id"] == "req_fake123" and not rec["fell_back"]
     assert rec["account"] == "me@example.org" and "me@example.org" in md
     assert [i["kind"] for i in rec["inputs"]] == ["brief", "file", "diff"]
+    assert b"\r\n" not in (work / "out.md").read_bytes()
 
 
 def test_request_shape(work):
     client = FakeClient()
     go(work, client, str(work / "a.py"), "--diff", str(work / "change.diff"))
-    kw = dict(client.calls[1][1])
+    kw = dict(client.calls[-1][1])
     assert kw["model"] == "claude-fable-5-2" and kw["output_config"] == {"effort": "high"}
     assert "thinking" not in kw  # Fable 5.2 thinks by default; explicit settings can 400
-    assert kw["betas"] == [review.FALLBACK_BETA] and kw["fallbacks"] == "default"
+    # Named targets, not "default", so the cap prices exactly the models that can run.
+    assert kw["betas"] == [review.FALLBACK_BETA]
+    assert kw["fallbacks"] == [{"model": "claude-opus-4-8"}, {"model": "claude-opus-5"}]
     content = kw["messages"][0]["content"]
     assert [c["type"] for c in content] == ["document", "document", "text"]  # materials, then brief
     assert content[0]["title"] == f"file: {work / 'a.py'}"
@@ -117,38 +133,70 @@ def test_request_shape(work):
     assert "Claude Code" not in kw["system"] and "Agent SDK" not in kw["system"]
     # Asking the model to write out its reasoning invites reasoning_extraction refusals.
     assert "reasoning" not in kw["system"].lower()
-    count_kw = client.calls[0][1]
-    assert count_kw["messages"] == kw["messages"] and count_kw["system"] == kw["system"]
+    for _, count_kw in client.calls[:-1]:
+        assert count_kw["messages"] == kw["messages"] and count_kw["system"] == kw["system"]
 
 
 def test_no_fallback_and_haiku_send_no_fallback_params(work):
     for extra in (["--no-fallback"], ["--model", "claude-haiku-5-5"]):
         client = FakeClient()
         go(work, client, str(work / "a.py"), "--overwrite", *extra)
-        kw = client.calls[1][1]
-        assert "fallbacks" not in kw and "betas" not in kw
+        kw = client.calls[-1][1]
+        assert "fallbacks" not in kw and "betas" not in kw and client.kinds() == ["count", "stream"]
+
+
+def test_haiku_never_gets_fallback_params():
+    brief = review.Material("brief", "b", "check it")
+    params = review.build_request(brief, [review.Material("file", "f", "x")], "claude-haiku-5-5",
+                                  "low", 100, fallback=True, line_numbers=True)
+    assert "fallbacks" not in params and "betas" not in params
+
+
+def test_pinned_worst_case():
+    counts = dict.fromkeys(FABLE_ATTEMPTS, 1000)
+    # 1,300 input (the margin) on each; Fable $8/$40, Opus 4.8 and Opus 5 $5/$25.
+    assert review.worst_case_cost(counts, 32_000) == pytest.approx(
+        (1300 * 8 + 32_000 * 40 + 2 * (1300 * 5 + 32_000 * 25)) / 1e6)  # $2.9034
+    assert review.worst_case_cost({"claude-fable-5-2": 1000}, 32_000) == pytest.approx(
+        (1300 * 8 + 32_000 * 40) / 1e6)
+
+
+def test_each_attempt_priced_on_its_own_count(work):
+    heavier = {"claude-fable-5-2": 1000, "claude-opus-4-8": 1000, "claude-opus-5": 400_000}
+    client = FakeClient(counted=heavier.get)
+    with pytest.raises(review.Refused, match="above --cap"):
+        go(work, client, str(work / "a.py"), "--cap", "4")
+    assert "stream" not in client.kinds()
 
 
 def test_cap_refuses_before_sending(work):
-    client = FakeClient(counted=900_000)
+    client = FakeClient(counted=500_000)
     with pytest.raises(review.Refused, match="above --cap"):
         go(work, client, str(work / "a.py"), "--cap", "1")
-    assert client.kinds() == ["count"]
+    assert "stream" not in client.kinds()
     assert not (work / "out.md").exists() and not (work / "out.md.json").exists()
+
+
+@pytest.mark.parametrize("cap", ["0", "-1", "nan", "inf"])
+def test_bad_caps_are_refused(work, cap):
+    client = FakeClient()
+    with pytest.raises(review.Refused, match="--cap"):
+        go(work, client, str(work / "a.py"), "--cap", cap)
+    assert client.calls == []
 
 
 def test_dry_run_sends_nothing(work):
     client = FakeClient()
     code, err = go(work, client, str(work / "a.py"), "--dry-run")
-    assert code == 0 and client.kinds() == ["count"] and "worst case $" in err
+    assert code == 0 and "stream" not in client.kinds() and "worst case $" in err
     assert not (work / "out.md").exists()
 
 
-def test_context_window(work):
-    client = FakeClient(counted=990_000)
+def test_context_window_uses_the_margin(work):
+    client = FakeClient(counted=900_000)   # 990,200 with the margin, plus 32,000 output
     with pytest.raises(review.Refused, match="context window"):
         go(work, client, str(work / "a.py"), "--cap", "1000")
-    assert client.kinds() == ["count"]
+    assert "stream" not in client.kinds()
 
 
 @pytest.mark.parametrize("planted, flag, refused", [
@@ -157,8 +205,15 @@ def test_context_window(work):
     ("sk-ant-admin01-" + "z" * 30, [], True),
     ("sk-ant-admin01-" + "z" * 30, ["--allow-key-like"], False),
     ("-----BEGIN OPENSSH PRIVATE KEY-----", [], True),
+    ("-----BEGIN PGP PRIVATE KEY BLOCK-----", [], True),
     ("ghp_" + "a" * 36, [], True),
     ("AKIA" + "ABCDEFGHIJKLMNOP", [], True),
+    ("ASIA" + "ABCDEFGHIJKLMNOP", [], True),
+    ("xoxb-" + "1234567890-abcdef", [], True),
+    ("sk-proj-" + "b" * 30, [], True),
+    ("sk_live_" + "c" * 24, [], True),
+    ("AIza" + "d" * 35, [], True),
+    ("npm_" + "e" * 36, [], True),
     ("mentions sk-ant- prefixes in prose", [], False),
 ])
 def test_secret_guard_stops_before_any_call(work, planted, flag, refused):
@@ -170,6 +225,31 @@ def test_secret_guard_stops_before_any_call(work, planted, flag, refused):
         assert client.calls == []
     else:
         assert go(work, client, str(work / "a.py"), *flag)[0] == 0
+
+
+@pytest.mark.parametrize("where", ["brief", "diff", "stdin"])
+def test_secret_guard_covers_every_input(work, where):
+    planted = f"token = '{JOB_KEY}'\n"
+    client = FakeClient()
+    with pytest.raises(review.Refused, match="the API key this job runs with"):
+        if where == "brief":
+            (work / "brief.md").write_text(planted)
+            go(work, client, str(work / "a.py"))
+        elif where == "diff":
+            (work / "change.diff").write_text(planted)
+            go(work, client, "--diff", str(work / "change.diff"))
+        else:
+            go(work, client, "--diff", "-", stdin_bytes=planted.encode())
+    assert client.calls == []
+
+
+def test_job_key_with_trailing_newline_is_still_caught(work):
+    (work / "a.py").write_text(f"x = '{JOB_KEY}'\n")
+    client = FakeClient()
+    with pytest.raises(review.Refused, match="the API key this job runs with"):
+        go(work, client, str(work / "a.py"), "--allow-key-like",
+           env={"ANTHROPIC_API_KEY": JOB_KEY + "\n"})
+    assert client.calls == []
 
 
 def test_key_never_reaches_outputs(work):
@@ -189,10 +269,31 @@ def test_refusal_writes_no_review(work):
     assert rec["exit_code"] == 3 and rec["stop_reason"] == "refusal"
 
 
-def test_cut_off_review_is_marked(work):
-    code, _ = go(work, FakeClient(message(stop="max_tokens")), str(work / "a.py"))
+def test_both_models_declining_writes_no_review(work):
+    usage = {"input_tokens": 1000, "output_tokens": 30, "iterations": [
+        {"type": "message", "model": "claude-fable-5-2", "input_tokens": 1000, "output_tokens": 20},
+        {"type": "fallback_message", "model": "claude-opus-4-8", "input_tokens": 1000, "output_tokens": 30},
+    ]}
+    content = [text("fable partial"), SimpleNamespace(type="fallback"), text("opus partial")]
+    code, _ = go(work, FakeClient(message(stop="refusal", model="claude-opus-4-8", usage=usage,
+                                          content=content)), str(work / "a.py"))
     md, _ = outputs(work)
-    assert code == 4 and "CUT OFF" in md and "VERDICT: APPROVE" in md
+    assert code == 3 and "the fallback declined too" in md
+    assert "fable partial" not in md and "opus partial" not in md
+
+
+@pytest.mark.parametrize("stop, content, status", [
+    ("max_tokens", None, "CUT OFF"),
+    ("model_context_window_exceeded", None, "STOPPED EARLY"),
+    (None, None, "STOPPED EARLY"),
+    ("pause_turn", None, "STOPPED EARLY"),
+    ("end_turn", [text("   \n")], "NO REVIEW TEXT"),
+    ("end_turn", [], "NO REVIEW TEXT"),
+])
+def test_only_a_finished_review_counts_as_complete(work, stop, content, status):
+    code, _ = go(work, FakeClient(message(stop=stop, content=content)), str(work / "a.py"))
+    md, rec = outputs(work)
+    assert code == 4 and status in md and rec["status"] != "complete"
 
 
 def test_fallback_is_priced_per_attempt_and_drops_declined_text(work):
@@ -201,19 +302,61 @@ def test_fallback_is_priced_per_attempt_and_drops_declined_text(work):
         {"type": "fallback_message", "model": "claude-opus-4-8", "input_tokens": 1000, "output_tokens": 400},
     ]}
     content = [text("half a sentence from"), SimpleNamespace(type="fallback"), text("VERDICT: APPROVE\nfine")]
-    msg = message(model="claude-opus-4-8", usage=usage, content=content)
+    # A stream's top-level model can still name the requested model after a fallback.
+    msg = message(model="claude-fable-5-2", usage=usage, content=content)
     code, _ = go(work, FakeClient(msg), str(work / "a.py"))
     md, rec = outputs(work)
     assert code == 0 and rec["fell_back"] and rec["served_model"] == "claude-opus-4-8"
+    assert "Written by: claude-opus-4-8 (a fallback" in md
     assert rec["cost_usd"] == pytest.approx((1000 * 8 + 50 * 40 + 1000 * 5 + 400 * 25) / 1e6)
     assert "half a sentence" not in md and "partial text is left out" in md
 
 
-def test_unknown_served_model_reports_unknown_cost(work):
-    msg = message(model="claude-something-new", usage={"input_tokens": 10, "output_tokens": 10})
-    go(work, FakeClient(msg), str(work / "a.py"))
+def test_fallback_then_cut_off(work):
+    usage = {"input_tokens": 1, "output_tokens": 1, "iterations": [
+        {"type": "message", "model": "claude-fable-5-2", "input_tokens": 1000, "output_tokens": 0},
+        {"type": "fallback_message", "model": "claude-opus-5", "input_tokens": 1000, "output_tokens": 900},
+    ]}
+    content = [SimpleNamespace(type="fallback"), text("VERDICT: REQUEST_CHANGES\n1. P1 ...")]
+    code, _ = go(work, FakeClient(message(stop="max_tokens", usage=usage, content=content)), str(work / "a.py"))
     md, rec = outputs(work)
-    assert rec["cost_usd"] is None and "unknown" in md
+    assert code == 4 and "CUT OFF" in md and rec["served_model"] == "claude-opus-5"
+
+
+def test_fallback_without_itemized_usage_reports_unknowns(work):
+    content = [text("declined bit"), SimpleNamespace(type="fallback"), text("VERDICT: APPROVE")]
+    msg = message(model="claude-fable-5-2", content=content)   # no usage.iterations
+    code, _ = go(work, FakeClient(msg), str(work / "a.py"))
+    md, rec = outputs(work)
+    assert rec["fell_back"] and rec["cost_usd"] is None and rec["served_model"] is None
+    assert "Written by: unknown" in md and "Cost at list price: unknown" in md
+    assert rec["attempts"][-1]["model"] is None and "unreported attempt (unreported)" in md
+
+
+def test_dated_snapshot_is_not_a_fallback(work):
+    msg = message(model="claude-fable-5-2-20261101")
+    code, _ = go(work, FakeClient(msg), str(work / "a.py"))
+    md, rec = outputs(work)
+    assert code == 0 and not rec["fell_back"] and rec["cost_usd"] == pytest.approx(0.028)
+
+
+def test_a_model_outside_the_priced_set_is_flagged(work):
+    usage = {"input_tokens": 1, "output_tokens": 1, "iterations": [
+        {"type": "message", "model": "claude-fable-5-2", "input_tokens": 1000, "output_tokens": 0},
+        {"type": "fallback_message", "model": "claude-something-new", "input_tokens": 1000, "output_tokens": 10},
+    ]}
+    content = [SimpleNamespace(type="fallback"), text("VERDICT: APPROVE")]
+    code, err = go(work, FakeClient(message(usage=usage, content=content)), str(work / "a.py"))
+    md, rec = outputs(work)
+    assert rec["unpriced_models_ran"] == ["claude-something-new"] and rec["cost_usd"] is None
+    assert "WARNING: a model outside the priced set ran" in md and "WARNING" in err
+
+
+def test_a_bill_above_the_worst_case_is_flagged(work):
+    msg = message(usage={"input_tokens": 1000, "output_tokens": 999_999})
+    go(work, FakeClient(msg), str(work / "a.py"), "--no-fallback", "--max-tokens", "100")
+    md, rec = outputs(work)
+    assert rec["over_worst_case"] and "is above the worst case" in md
 
 
 def test_refuses_to_overwrite(work):
@@ -222,6 +365,41 @@ def test_refuses_to_overwrite(work):
     with pytest.raises(review.Refused, match="exists"):
         go(work, client, str(work / "a.py"))
     assert client.calls == [] and (work / "out.md").read_text() == "earlier review"
+
+
+def test_refuses_when_only_the_record_exists(work):
+    (work / "out.md.json").write_text("{}")
+    with pytest.raises(review.Refused, match="exists"):
+        go(work, FakeClient(), str(work / "a.py"))
+
+
+def test_unwritable_out_is_refused_before_paying(work):
+    client = FakeClient()
+    with pytest.raises(review.Refused, match="doesn't exist"):
+        go(work, client, str(work / "a.py"), out=str(work / "missing" / "out.md"))
+    (work / "adir").mkdir()
+    with pytest.raises(review.Refused, match="is a folder"):
+        go(work, client, str(work / "a.py"), "--overwrite", out=str(work / "adir"))
+    assert client.calls == []
+
+
+def test_a_write_failure_after_paying_prints_the_review(work, monkeypatch):
+    def broken(path, text):
+        raise PermissionError(13, "Permission denied")
+    monkeypatch.setattr(review, "_atomic_write", broken)
+    code, err = go(work, FakeClient(), str(work / "a.py"))
+    assert code == 6 and "paid, but couldn't write" in err
+    assert "VERDICT: APPROVE" in go.stdout and '"cost_usd": 0.028' in go.stdout
+
+
+def test_atomic_write_leaves_no_temp_file_on_failure(tmp_path, monkeypatch):
+    target = tmp_path / "r.md"
+    def fail(src, dst):
+        raise PermissionError(13, "locked")
+    monkeypatch.setattr(review.os, "replace", fail)
+    with pytest.raises(PermissionError):
+        review._atomic_write(str(target), "x")
+    assert os.listdir(tmp_path) == []
 
 
 def test_inputs(work):
@@ -233,16 +411,29 @@ def test_inputs(work):
             go(work, FakeClient(), str(work / bad))
     with pytest.raises(review.Refused, match="nothing to review"):
         go(work, FakeClient())
+    with pytest.raises(review.Refused, match="only one of --brief and --diff"):
+        go(work, FakeClient(), "--diff", "-", brief="-")
     code, _ = go(work, FakeClient(), "--diff", "-", stdin_bytes=b"--- a\n+++ b\n")
     assert code == 0 and outputs(work)[1]["inputs"][1]["name"] == "(stdin)"
 
 
-def test_price_lookup_prefers_longest_prefix():
+def test_utf16_and_crlf_inputs(work):
+    (work / "ps.diff").write_bytes("﻿--- a\r\n+++ b\r\n".encode("utf-16-le"))
+    (work / "crlf.py").write_bytes(b"one\r\ntwo\r\n")
+    client = FakeClient()
+    assert go(work, client, str(work / "crlf.py"), "--diff", str(work / "ps.diff"))[0] == 0
+    content = client.calls[-1][1]["messages"][0]["content"]
+    assert content[0]["source"]["data"] == "1  one\n2  two"
+    assert content[1]["source"]["data"].startswith("--- a")
+
+
+def test_price_lookup():
     assert review.prices_for("claude-opus-5-5-20261101", 10) == review.PRICES["claude-opus-5-5"]
     assert review.prices_for("claude-opus-5", 10) == (5.00, 25.00)
     assert review.prices_for("claude-haiku-5-5", 200_000) == review.HAIKU_LONG_PRICES
-    with pytest.raises(KeyError):
-        review.prices_for("claude-opus-55", 10)
+    for unknown in ("claude-opus-55", "claude-opus-5-1", None):
+        with pytest.raises(KeyError):
+            review.prices_for(unknown, 10)
 
 
 def test_input_margin_and_cache_prices():
@@ -253,38 +444,78 @@ def test_input_margin_and_cache_prices():
     assert row["cost_usd"] == pytest.approx((100 * 8 + 1000 * 8 * 1.25 + 10_000 * 8 * 0.10 + 10 * 40) / 1e6)
 
 
-def test_haiku_never_gets_fallback_params():
-    brief = review.Material("brief", "b", "check it")
-    params = review.build_request(brief, [review.Material("file", "f", "x")], "claude-haiku-5-5",
-                                  "low", 100, fallback=True, line_numbers=True)
-    assert "fallbacks" not in params and "betas" not in params
-
-
-def test_credit_error_message(monkeypatch):
+def test_api_error_messages(monkeypatch):
     monkeypatch.setenv("CLAUDE_CREDITS_ACCOUNT", "me@example.org")
     assert "claude-credits mark me@example.org exhausted" in review.api_error_message(
         400, "Your credit balance is too low to access the Anthropic API.")
-    assert "(529)" in review.api_error_message(529, "Overloaded")
+    assert "nothing was billed" in review.api_error_message(529, "Overloaded")
+    assert "(500)" in review.api_error_message(500, "boom")
+
+
+class FakeSDK:
+    class APIError(Exception):
+        pass
+
+    class APIStatusError(APIError):
+        def __init__(self, status_code, text):
+            super().__init__(text)
+            self.status_code = status_code
+
+    class APIConnectionError(APIError):
+        pass
+
+    def __init__(self, client):
+        self._client = client
+
+    def Anthropic(self, **kw):
+        return self._client
+
+
+class LostConnection(Exception):
+    pass
+
+
+@pytest.mark.parametrize("exc, code, says", [
+    (FakeSDK.APIStatusError(400, "Your credit balance is too low"), 5, "used up"),
+    (FakeSDK.APIStatusError(529, "Overloaded"), 5, "overloaded"),
+    (FakeSDK.APIConnectionError("down"), 5, "the request failed"),
+    (LostConnection("mid-stream"), 5, "may still be billed"),
+])
+def test_main_maps_errors_to_exit_codes(work, monkeypatch, capsys, exc, code, says):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", JOB_KEY)
+    argv = ["--brief", str(work / "brief.md"), "--out", str(work / "out.md"), str(work / "a.py")]
+    rc = review.main(argv, sdk=FakeSDK(FakeClient(raises=exc)), transport_errors=(LostConnection,))
+    assert rc == code and says in capsys.readouterr().err
+    assert not (work / "out.md").exists()
+
+
+def test_main_refusals_exit_2(work, monkeypatch, capsys):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", JOB_KEY)
+    for extra in (["--max-tokens", "0"], ["--cap", "nan"]):
+        argv = ["--brief", str(work / "brief.md"), "--out", str(work / "out.md"), str(work / "a.py"), *extra]
+        client = FakeClient()
+        assert review.main(argv, sdk=FakeSDK(client), transport_errors=()) == 2
+        assert client.calls == []
 
 
 @settings(max_examples=300, deadline=None)
 @given(
     model=st.sampled_from(review.MODELS),
     fallback=st.booleans(),
-    counted=st.integers(1, 900_000),
     max_tokens=st.integers(1, 128_000),
     data=st.data(),
 )
-def test_the_cap_bounds_every_bill(model, fallback, counted, max_tokens, data):
-    """Whatever attempts run (the requested model, then any permitted fallbacks, each at
-    most once), with billed input within the counting margin and output within
-    max_tokens, the bill never exceeds the worst case the cap is checked against."""
-    worst = review.worst_case_cost(model, counted, max_tokens, fallback)
+def test_the_cap_bounds_every_bill(model, fallback, max_tokens, data):
+    """Whatever attempts run (the requested model, then any of the named fallbacks, each
+    at most once), with billed input within each model's counting margin and output
+    within max_tokens, the bill never exceeds the worst case the cap is checked against."""
     allowed = [model] + (list(review.FALLBACK_TARGETS[model]) if fallback else [])
+    counts = {m: data.draw(st.integers(1, 900_000)) for m in allowed}
+    worst = review.worst_case_cost(counts, max_tokens)
     ran = data.draw(st.lists(st.sampled_from(allowed), unique=True, min_size=1))
-    bound = review.billable_input_bound(counted)
     bill = 0.0
     for m in ran:
-        u = {"input_tokens": data.draw(st.integers(0, bound)), "output_tokens": data.draw(st.integers(0, max_tokens))}
+        u = {"input_tokens": data.draw(st.integers(0, review.billable_input_bound(counts[m]))),
+             "output_tokens": data.draw(st.integers(0, max_tokens))}
         bill += review.attempt_cost(m, u)["cost_usd"]
     assert bill <= worst + 1e-12
