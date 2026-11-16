@@ -31,4 +31,4 @@ jobs:
           uvx --from "$wheel" claude-credits --version
           CLAUDE_CREDITS_HOME="$RUNNER_TEMP/cc-home" uvx --from "$wheel" claude-credits list
           uvx --from "$wheel" claude-credits examples "$RUNNER_TEMP/examples"
-          test -f "$RUNNER_TEMP/examples/hello.py" && test -f "$RUNNER_TEMP/examples/batch.py"
+          test -f "$RUNNER_TEMP/examples/hello.py" && test -f "$RUNNER_TEMP/examples/batch.py" && test -f "$RUNNER_TEMP/examples/review.py"

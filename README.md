@@ -67,19 +67,31 @@ The key reaches that command and any programs it starts, and nothing else. It fi
 a 1-token test request so a dead key fails fast; `--no-verify` skips that.
 
 ```bash
-claude-credits examples                  # copies two example jobs into ./claude-credits-examples
+claude-credits examples                  # copies three example jobs into ./claude-credits-examples
 claude-credits exec -- uv run claude-credits-examples/hello.py "What is a refundable tax credit?"
 claude-credits exec -- uv run claude-credits-examples/batch.py prompts.txt --out results.jsonl
+claude-credits exec -- uv run claude-credits-examples/review.py --brief brief.md --diff change.diff --out review.md
 claude-credits exec -- python my_script.py
 ```
 
 - **`hello.py`** sends one request to Claude Opus 5.5.
 - **`batch.py`** sends a file of prompts (one per line) through the Message Batches API.
   It costs half the normal price, and most batches finish within an hour.
+- **`review.py`** sends a brief plus files or a diff to Claude Fable 5.2 in one request and
+  writes the review to a file, with its token counts and list-price cost beside it. It
+  counts the prompt's tokens first (free) and refuses if the worst case would cost more than
+  `--cap` dollars (default 5). Anthropic calls that count an estimate, so the worst case
+  allows 10% plus 200 tokens more input, and the review's header flags any bill above it.
+  The request id goes to stderr as soon as the stream opens. If the stream breaks or ends
+  early, or Ctrl-C, SIGTERM or SIGHUP stops it, after output begins, what arrived is saved
+  and marked incomplete. The model sees
+  only what you send: no repository, tools or project instructions, so put what the review
+  needs in the brief. `--dry-run` prices it without sending; `gh pr diff 123 | ... --diff -`
+  reviews a pull request.
 - **Your own code** with the Anthropic SDK needs no changes: `anthropic.Anthropic()`
   reads `ANTHROPIC_API_KEY` by itself.
 
-Prices per million tokens (input/output), at standard rates: Opus 5.5 $4/$20, Sonnet 5.5
+Prices per million tokens (input/output), at standard rates: Fable 5.2 $8/$40, Opus 5.5 $4/$20, Sonnet 5.5
 $2/$10, Haiku 5.5 $0.10/$0.50 for prompts up to 100K tokens ($0.50/$2.50 beyond). Batch
 halves them. As a rough guide, $200 buys 25 million input plus 5 million output tokens on
 Opus 5.5.

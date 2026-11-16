@@ -23,6 +23,7 @@ only-include = ["claude_credits.py"]
 [tool.hatch.build.targets.wheel.force-include]
 "examples/hello.py" = "claude_credits_examples/hello.py"
 "examples/batch.py" = "claude_credits_examples/batch.py"
+"examples/review.py" = "claude_credits_examples/review.py"
 
 [tool.hatch.build.targets.sdist]
 only-include = ["claude_credits.py", "README.md", "LICENSE", "examples", "tests", "pyproject.toml"]
