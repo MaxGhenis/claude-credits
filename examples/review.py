@@ -462,6 +462,9 @@ def report(args, message, request_id, seconds, counts, worst, allowed, fallback,
         body, code = "", 3
     elif stop in COMPLETE_STOPS and text.strip():
         status, body, code = "complete", text, 0
+    elif stop == "max_tokens" and not text.strip():
+        status, body, code = (f"CUT OFF at --max-tokens {args.max_tokens:,} before any review text "
+                              "(thinking counts as output); raise --max-tokens."), "", 4
     elif stop == "max_tokens":
         status, body, code = f"CUT OFF at --max-tokens {args.max_tokens:,}; the review below is incomplete.", text, 4
     elif not text.strip():
@@ -539,7 +542,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--out", required=True, help="write the review here, and its record to OUT.json")
     p.add_argument("--model", default="claude-fable-5-2", choices=MODELS)
     p.add_argument("--effort", default="high", choices=EFFORTS)
-    p.add_argument("--max-tokens", type=int, default=32_000, help="output cap, thinking included")
+    p.add_argument("--max-tokens", type=int, default=32_000,
+                   help="output cap, thinking included; Fable can think through 4,000 before writing")
     p.add_argument("--cap", type=float, default=5.0, help="refuse if the worst case costs more (USD)")
     p.add_argument("--dry-run", action="store_true", help="count tokens and price the worst case; send nothing")
     p.add_argument("--no-fallback", action="store_true", help="don't rerun a declined request on another model")

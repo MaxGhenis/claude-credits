@@ -306,6 +306,7 @@ def test_both_models_declining_writes_no_review(work):
     ("pause_turn", None, "STOPPED EARLY"),
     ("end_turn", [text("   \n")], "NO REVIEW TEXT"),
     ("end_turn", [], "NO REVIEW TEXT"),
+    ("max_tokens", [], "before any review text"),
 ])
 def test_only_a_finished_review_counts_as_complete(work, stop, content, status):
     code, _ = go(work, FakeClient(message(stop=stop, content=content)), str(work / "a.py"))
