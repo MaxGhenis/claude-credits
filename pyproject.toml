@@ -8,7 +8,7 @@ version = "0.2.0"
 description = "Keep your Claude Max plan's monthly API credit key in your OS keychain and run jobs on it."
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = ["keyring>=24"]
 
 [project.urls]

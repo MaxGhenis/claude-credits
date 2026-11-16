@@ -35,7 +35,7 @@ uv tool install git+https://github.com/MaxGhenis/claude-credits
 
 `pipx install git+https://github.com/MaxGhenis/claude-credits` works too. If someone sent
 you the `.whl` file, run `uv tool install claude_credits-0.2.0-py3-none-any.whl`. It runs
-on macOS, Windows and Linux with Python 3.10 or later.
+on macOS, Windows and Linux with Python 3.11 or later.
 
 ## 3. Add your key
 
