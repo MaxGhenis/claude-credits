@@ -529,7 +529,13 @@ def test_input_margin_and_cache_prices():
     row = review.attempt_cost("claude-fable-5-2", {"input_tokens": 100, "output_tokens": 10,
                                                    "cache_creation_input_tokens": 1000,
                                                    "cache_read_input_tokens": 10_000})
-    assert row["cost_usd"] == pytest.approx((100 * 8 + 1000 * 8 * 1.25 + 10_000 * 8 * 0.10 + 10 * 40) / 1e6)
+    assert row["cost_usd"] == pytest.approx((100 * 8 + 1000 * 8 * 1.25 + 10_000 * 0.20 + 10 * 40) / 1e6)
+    reads = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 1_000_000}
+    for model, price in (("claude-fable-5-2", 0.20), ("claude-opus-5-5", 0.20),
+                         ("claude-sonnet-5-5", 0.10), ("claude-opus-5", 0.50),
+                         ("claude-opus-4-8", 0.50), ("claude-sonnet-5", 0.20),
+                         ("claude-haiku-5-5", 0.05), ("claude-fable-5-2-20261101", 0.20)):
+        assert review.attempt_cost(model, reads)["cost_usd"] == pytest.approx(price), model
 
 
 def test_api_error_messages(monkeypatch):

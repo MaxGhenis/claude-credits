@@ -56,7 +56,11 @@ PRICES = {
 }
 HAIKU_LONG_PROMPT = 100_000           # Haiku 5.5 costs more above this many input tokens
 HAIKU_LONG_PRICES = (0.50, 2.50)
-CACHE_WRITE, CACHE_READ = 1.25, 0.10  # multiples of the input price
+CACHE_WRITE = 1.25    # 5-minute cache writes, as a multiple of the input price
+# Cache reads in USD per million tokens where the model has its own rate (cached
+# 2026-11-03); every other model reads at CACHE_READ times its input price.
+CACHE_READ_PRICES = {"claude-fable-5-2": 0.20, "claude-opus-5-5": 0.20, "claude-sonnet-5-5": 0.10}
+CACHE_READ = 0.10
 MODELS = ("claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5")
 # Each model's permitted fallbacks, in the order they're tried, as the Models API lists
 # them (allowed_fallback_models, read 2026-11-15). The request names these explicitly, so
@@ -297,7 +301,8 @@ def attempt_cost(model: str | None, u: dict) -> dict:
     except KeyError:
         row["cost_usd"] = None
         return row
-    row["cost_usd"] = (inp * pin + cw * pin * CACHE_WRITE + cr * pin * CACHE_READ + out * pout) / 1e6
+    pread = CACHE_READ_PRICES.get(price_key(model), pin * CACHE_READ)
+    row["cost_usd"] = (inp * pin + cw * pin * CACHE_WRITE + cr * pread + out * pout) / 1e6
     return row
 
 
