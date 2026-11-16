@@ -32,9 +32,9 @@ def message(content=None, stop="end_turn", model="claude-fable-5-2", usage=None,
 
 
 class FakeStream:
-    def __init__(self, msg, raises=None, during=None, partial=None):
+    def __init__(self, msg, raises=None, during=None, partial=None, on_exit=None):
         self.msg, self.raises, self.during, self.request_id = msg, raises, during, "req_fake123"
-        self.partial = partial
+        self.partial, self.on_exit = partial, on_exit
 
     @property
     def current_message_snapshot(self):   # like the SDK: asserts until an event has arrived
@@ -44,7 +44,9 @@ class FakeStream:
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *exc):   # the SDK closes the response here
+        if self.on_exit:
+            self.on_exit()
         return False
 
     def get_final_message(self):
@@ -58,7 +60,8 @@ class FakeStream:
 class FakeClient:
     """raises: an exception when the stream opens; mid_stream: one while it streams."""
 
-    def __init__(self, msg=None, counted=1000, raises=None, mid_stream=None, during=None, partial=None):
+    def __init__(self, msg=None, counted=1000, raises=None, mid_stream=None, during=None, partial=None,
+                 on_exit=None):
         self.calls, self.retries = [], []
         outer = self
 
@@ -73,7 +76,7 @@ class FakeClient:
                 outer.calls.append(("stream", kw))
                 if raises is not None:
                     raise raises
-                return FakeStream(msg if msg is not None else message(), mid_stream, during, partial)
+                return FakeStream(msg if msg is not None else message(), mid_stream, during, partial, on_exit)
 
         class Unretried:      # what with_options(max_retries=0) returns
             beta = SimpleNamespace(messages=BetaMessages())
@@ -798,3 +801,51 @@ def test_when_stdout_fails_too_the_request_id_still_reaches_stderr(work, monkeyp
     code = review.run(args, FakeClient(), env={"ANTHROPIC_API_KEY": JOB_KEY}, err=err, out=DeadOut(),
                       clock=iter([0.0, 1.0]).__next__)
     assert code == 6 and "stdout failed too" in err.getvalue() and "req_fake123" in err.getvalue()
+
+
+# Round 5 (Subfleet r3): the stream's own cleanup runs inside the save path.
+
+def close_fails():
+    raise OSError(104, "connection reset on close")
+
+
+@posix_only
+def test_a_signal_while_the_stream_closes_still_saves_an_early_end(work):
+    client = FakeClient(partial_message(), on_exit=lambda: os.kill(os.getpid(), signal.SIGTERM))
+    rc, err = go(work, client, str(work / "a.py"))
+    md, rec = outputs(work)
+    assert rc == 143 and "INCOMPLETE: stopped by signal 15" in md and "half a find" in md
+    assert rec["usage_incomplete"] is True and rec["exit_code"] == 143
+
+
+@posix_only
+def test_a_signal_while_a_finished_stream_closes_keeps_the_review(work):
+    client = FakeClient(on_exit=lambda: os.kill(os.getpid(), signal.SIGTERM))
+    rc, err = go(work, client, str(work / "a.py"))
+    md, rec = outputs(work)
+    assert rc == 0 and "VERDICT: APPROVE" in md and "stopped by signal 15" in md
+    assert "the token counts are final" in md and rec["usage_incomplete"] is False
+
+
+def test_a_close_error_after_a_finished_stream_keeps_the_review(work):
+    rc, err = go(work, FakeClient(on_exit=close_fails), str(work / "a.py"))
+    md, rec = outputs(work)
+    assert rc == 0 and "VERDICT: APPROVE" in md and "OSError" in md and rec["usage_incomplete"] is False
+
+
+def test_a_close_error_after_an_early_end_is_incomplete(work):
+    rc, err = go(work, FakeClient(partial_message(), on_exit=close_fails), str(work / "a.py"))
+    md, rec = outputs(work)
+    assert rc == 5 and "INCOMPLETE" in md and "half a find" in md and rec["usage_incomplete"] is True
+
+
+def test_a_close_error_with_nothing_streamed_names_the_request(work):
+    with pytest.raises(review.StreamFailed) as e:
+        go(work, FakeClient(mid_stream=LostConnection("reset"), on_exit=close_fails), str(work / "a.py"))
+    assert e.value.request_id == "req_fake123" and not (work / "out.md").exists()
+
+
+def test_an_error_opening_the_stream_passes_through_unwrapped(work):
+    with pytest.raises(LostConnection):
+        go(work, FakeClient(raises=LostConnection("refused")), str(work / "a.py"))
+    assert not (work / "out.md").exists()

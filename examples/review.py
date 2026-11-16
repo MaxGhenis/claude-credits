@@ -494,26 +494,29 @@ def paid_request(args, client, params, counts, worst, allowed, fallback,
     # Errors while opening the stream (status codes, connection) pass through as they are;
     # anything after that is a StreamFailed, since output may already have been billed.
     started = clock()
-    failure = None
-    with contextlib.ExitStack() as stack:
-        stream = stack.enter_context(client.with_options(max_retries=0).beta.messages.stream(**params))
-        request_id = getattr(stream, "request_id", None)
-        if request_id:   # first, so the id survives even a kill no handler can catch
-            print(f"review: request id {request_id}", file=err)
-        try:
+    failure = stream = message = request_id = None
+    try:
+        # The stream's own cleanup (closing the response in __exit__) is inside this try too,
+        # so a signal or a close error there can't lose what has already been paid for.
+        with client.with_options(max_retries=0).beta.messages.stream(**params) as stream:
+            request_id = getattr(stream, "request_id", None)
+            if request_id:   # first, so the id survives even a kill no handler can catch
+                print(f"review: request id {request_id}", file=err)
             message = stream.get_final_message()
-        except BaseException as e:
+    except BaseException as e:
+        if stream is None:
+            raise   # opening the stream failed, so nothing streamed
+        if message is None:
             message = snapshot(stream)   # what streamed before the failure, if anything
-            if message is None:
-                if isinstance(e, (KeyboardInterrupt, Terminated)):
-                    raise
-                raise StreamFailed(e, request_id) from e
-            failure = ((stop_reason_text(e), stop_code(e)) if isinstance(e, (KeyboardInterrupt, Terminated))
-                       else (f"the stream failed ({type(e).__name__}: {e})", 5))
-        else:
-            if getattr(message, "stop_reason", None) is None:
-                # The SDK returns what it has if the body ends before the final events.
-                failure = ("the stream ended before Anthropic's final event", 5)
+        if message is None:
+            if isinstance(e, (KeyboardInterrupt, Terminated)):
+                raise
+            raise StreamFailed(e, request_id) from e
+        failure = ((stop_reason_text(e), stop_code(e)) if isinstance(e, (KeyboardInterrupt, Terminated))
+                   else (f"the stream failed ({type(e).__name__}: {e})", 5))
+    if failure is None and getattr(message, "stop_reason", None) is None:
+        # The SDK returns what it has if the body ends before the final events.
+        failure = ("the stream ended before Anthropic's final event", 5)
     seconds = clock() - started
     try:
         raw_text = review_text(message)[0]
