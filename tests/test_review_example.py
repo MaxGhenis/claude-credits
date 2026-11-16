@@ -3,6 +3,8 @@ import importlib.util
 import io
 import json
 import os
+import signal
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -308,7 +310,6 @@ def test_both_models_declining_writes_no_review(work):
 @pytest.mark.parametrize("stop, content, status", [
     ("max_tokens", None, "CUT OFF"),
     ("model_context_window_exceeded", None, "STOPPED EARLY"),
-    (None, None, "STOPPED EARLY"),
     ("pause_turn", None, "STOPPED EARLY"),
     ("end_turn", [text("   \n")], "NO REVIEW TEXT"),
     ("end_turn", [], "NO REVIEW TEXT"),
@@ -473,7 +474,7 @@ def test_a_write_failure_after_paying_prints_the_review(work, monkeypatch):
         raise PermissionError(13, "Permission denied")
     monkeypatch.setattr(review, "_atomic_write", broken)
     code, err = go(work, FakeClient(), str(work / "a.py"))
-    assert code == 6 and "paid, but couldn't write" in err
+    assert code == 6 and "paid (request id req_fake123), but couldn't write" in err
     assert "VERDICT: APPROVE" in go.stdout and '"cost_usd": 0.028' in go.stdout
 
 
@@ -700,3 +701,100 @@ def test_the_bill_is_flagged_once_input_passes_the_counting_margin(work):
         go(work, FakeClient(msg, counted=counted), str(work / "a.py"), "--no-fallback", "--overwrite")
         md, rec = outputs(work)
         assert rec["over_worst_case"] is flagged and ("WARNING" in md) is flagged
+
+
+# Round 4 (in-session check): signals, an early end, final counts, names before reading.
+
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
+
+
+@posix_only
+@pytest.mark.parametrize("sig", ["SIGTERM", "SIGHUP"])
+def test_a_signal_mid_stream_saves_what_arrived_and_restores_handlers(work, sig):
+    signum = getattr(signal, sig)
+
+    def sentinel(*a):   # the caller's own handler, which the run must put back
+        raise AssertionError("the caller's handler ran during the request")
+
+    original = signal.signal(signum, sentinel)
+    try:
+        client = FakeClient(partial=partial_message(), during=lambda: os.kill(os.getpid(), signum))
+        rc, err = go(work, client, str(work / "a.py"))
+        assert signal.getsignal(signum) is sentinel
+    finally:
+        signal.signal(signum, original)
+    md, rec = outputs(work)
+    assert rc == 128 + signum and f"stopped by signal {signum}" in md and "half a find" in md
+    assert rec["usage_incomplete"] is True and rec["exit_code"] == 128 + signum
+
+
+@posix_only
+def test_a_signal_before_any_output_exits_with_its_code(work, monkeypatch, capsys):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", JOB_KEY)
+    argv = ["--brief", str(work / "brief.md"), "--out", str(work / "out.md"), str(work / "a.py")]
+    client = FakeClient(during=lambda: os.kill(os.getpid(), signal.SIGTERM))
+    assert review.main(argv, sdk=FakeSDK(client)) == 143
+    err = capsys.readouterr().err
+    assert "stopped by signal 15" in err and "request id req_fake123" in err
+    assert not (work / "out.md").exists()
+
+
+def test_the_request_id_is_printed_as_soon_as_the_stream_opens(work):
+    code, err = go(work, FakeClient(), str(work / "a.py"))
+    assert code == 0 and err.index("review: request id req_fake123") < err.index("complete")
+
+
+def test_a_stream_that_ends_before_its_final_event_is_incomplete(work):
+    rc, err = go(work, FakeClient(partial_message()), str(work / "a.py"))
+    md, rec = outputs(work)
+    assert rc == 5 and "INCOMPLETE: the stream ended before Anthropic's final event" in md
+    assert rec["usage_incomplete"] is True and "half a find" in md
+
+
+def test_a_failure_after_the_final_counts_keeps_the_real_outcome(work):
+    done = message(usage={"input_tokens": 1000, "output_tokens": 500})
+    rc, err = go(work, FakeClient(mid_stream=LostConnection("reset"), partial=done), str(work / "a.py"))
+    md, rec = outputs(work)
+    assert rc == 0 and rec["usage_incomplete"] is False and "the token counts are final" in md
+    declined = message(stop="refusal", content=[text("partial words")], details={"category": "cyber"})
+    rc, err = go(work, FakeClient(mid_stream=KeyboardInterrupt(), partial=declined), str(work / "a.py"),
+                 "--overwrite")
+    md, rec = outputs(work)
+    assert rc == 3 and "DECLINED" in md and "partial words" not in md
+
+
+def test_a_key_in_a_missing_file_name_is_refused_before_reading(work):
+    with pytest.raises(review.Refused, match="the name of file input 2") as e:
+        go(work, FakeClient(), str(work / f"{JOB_KEY}.txt"), "--allow-key-like")
+    assert JOB_KEY not in str(e.value) and "can't read" not in str(e.value)
+
+
+def test_the_job_key_split_across_lines_is_still_caught(work):
+    (work / "a.py").write_text(f"key, wrapped by an editor:\n{JOB_KEY[:15]}\n  {JOB_KEY[15:]}\n")
+    with pytest.raises(review.Refused, match="the API key this job runs with"):
+        go(work, FakeClient(), str(work / "a.py"), "--allow-key-like")
+
+
+def test_an_auth_token_is_screened_like_the_api_key(work):
+    token = "oauth-" + "T" * 40
+    (work / "a.py").write_text(f"t = '{token}'\n")
+    with pytest.raises(review.Refused, match="the API key this job runs with"):
+        go(work, FakeClient(), str(work / "a.py"), "--allow-key-like", env={"ANTHROPIC_AUTH_TOKEN": token})
+
+
+def test_when_stdout_fails_too_the_request_id_still_reaches_stderr(work, monkeypatch):
+    monkeypatch.setattr(review, "_atomic_write", lambda p, t: (_ for _ in ()).throw(PermissionError(13, "locked")))
+
+    class DeadOut:
+        def write(self, *a):
+            raise OSError(5, "stdout gone")
+
+        def flush(self):
+            raise OSError(5, "stdout gone")
+
+    args = review.parser().parse_args(["--brief", str(work / "brief.md"), "--out", str(work / "out.md"),
+                                       str(work / "a.py")])
+    err = io.StringIO()
+    code = review.run(args, FakeClient(), env={"ANTHROPIC_API_KEY": JOB_KEY}, err=err, out=DeadOut(),
+                      clock=iter([0.0, 1.0]).__next__)
+    assert code == 6 and "stdout failed too" in err.getvalue() and "req_fake123" in err.getvalue()

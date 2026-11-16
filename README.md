@@ -81,8 +81,10 @@ claude-credits exec -- python my_script.py
   writes the review to a file, with its token counts and list-price cost beside it. It
   counts the prompt's tokens first (free) and refuses if the worst case would cost more than
   `--cap` dollars (default 5). Anthropic calls that count an estimate, so the worst case
-  allows 10% more input, and the review's header flags any bill above it. If the stream
-  breaks after output begins, what arrived is saved and marked incomplete. The model sees
+  allows 10% plus 200 tokens more input, and the review's header flags any bill above it.
+  The request id goes to stderr as soon as the stream opens. If the stream breaks or ends
+  early, or Ctrl-C, SIGTERM or SIGHUP stops it, after output begins, what arrived is saved
+  and marked incomplete. The model sees
   only what you send: no repository, tools or project instructions, so put what the review
   needs in the brief. `--dry-run` prices it without sending; `gh pr diff 123 | ... --diff -`
   reviews a pull request.
