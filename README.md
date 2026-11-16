@@ -80,9 +80,12 @@ claude-credits exec -- python my_script.py
 - **`review.py`** sends a brief plus files or a diff to Claude Fable 5.2 in one request and
   writes the review to a file, with its token counts and list-price cost beside it. It
   counts the prompt's tokens first (free) and refuses if the worst case would cost more than
-  `--cap` dollars (default 5). The model sees only what you send: no repository, tools or
-  project instructions, so put what the review needs in the brief. `--dry-run` prices it
-  without sending; `gh pr diff 123 | ... --diff -` reviews a pull request.
+  `--cap` dollars (default 5). Anthropic calls that count an estimate, so the worst case
+  allows 10% more input, and the review's header flags any bill above it. If the stream
+  breaks after output begins, what arrived is saved and marked incomplete. The model sees
+  only what you send: no repository, tools or project instructions, so put what the review
+  needs in the brief. `--dry-run` prices it without sending; `gh pr diff 123 | ... --diff -`
+  reviews a pull request.
 - **Your own code** with the Anthropic SDK needs no changes: `anthropic.Anthropic()`
   reads `ANTHROPIC_API_KEY` by itself.
 

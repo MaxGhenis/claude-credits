@@ -11,7 +11,10 @@
 It sends one Messages API request (Claude Fable 5.2 at high effort unless you pick another
 model), writes the review to --out, and writes its token counts and list-price cost beside
 it in --out + ".json". Before sending, it counts the prompt's tokens (free calls) and
-refuses if the most the request could cost is more than --cap dollars.
+refuses if the most the request could cost is more than --cap dollars. Output is held to
+--max-tokens by the API; input can't be, and Anthropic calls its count an estimate, so the
+worst case allows 10% plus 200 tokens more input than counted. A bill above that is flagged
+in the review's header.
 
 The model sees only what you pass. It can't open other files, run tests or follow links,
 and it gets no project instructions, so put everything the review needs in the brief and
@@ -24,9 +27,11 @@ those attempts. The review's header names the model that wrote it. --no-fallback
 fallbacks off.
 
 The credential screen is best-effort: it stops the job's own key and common token shapes,
-not every secret. Exit codes: 0 complete, 2 refused before sending, 3 declined, 4 stopped
-early or empty, 5 API or network error, 6 paid but the files couldn't be written (the
-review then goes to stdout as UTF-8), 130 interrupted.
+not every secret; it checks file names too, since they go to the model as titles. If the
+stream fails or you press Ctrl-C after output has begun, whatever arrived is saved, marked
+incomplete. Exit codes: 0 complete, 2 refused before sending, 3 declined, 4 stopped early or
+empty, 5 API or network error, 6 paid but the files couldn't be written (the review and what
+is known of its bill then go to stdout as UTF-8), 130 interrupted.
 """
 from __future__ import annotations
 
@@ -114,9 +119,10 @@ class Refused(Exception):
 class StreamFailed(Exception):
     """The request was accepted, then failed while the review was streaming."""
 
-    def __init__(self, original: BaseException):
+    def __init__(self, original: BaseException, request_id: str | None = None):
         super().__init__(f"{type(original).__name__}: {original}")
         self.original = original
+        self.request_id = request_id
 
 
 @dataclass
@@ -183,16 +189,19 @@ def load_inputs(args, stdin) -> tuple[Material, list[Material]]:
 
 
 def check_secrets(items: list[Material], env_key: str | None, allow_key_like: bool) -> None:
+    """Screen each input's name (sent as its title) and then its text. A name that fails is
+    described by position, so the refusal doesn't print what it refused to send."""
     key = (env_key or "").strip()
-    for m in items:
-        if len(key) >= 20 and key in m.text:
-            raise Refused(f"{m.kind} {m.name} contains the API key this job runs with; remove it")
-        if allow_key_like:
-            continue
-        for label, pattern in SECRET_PATTERNS:
-            if pattern.search(m.text):
-                raise Refused(f"{m.kind} {m.name} contains what looks like {label}; redact it, "
-                              "or pass --allow-key-like if it's a dummy value")
+    for i, m in enumerate(items):
+        for value, where in ((m.name, f"the name of {m.kind} input {i + 1}"), (m.text, f"{m.kind} {m.name}")):
+            if len(key) >= 20 and key in value:
+                raise Refused(f"{where} contains the API key this job runs with; remove it")
+            if allow_key_like:
+                continue
+            for label, pattern in SECRET_PATTERNS:
+                if pattern.search(value):
+                    raise Refused(f"{where} contains what looks like {label}; redact it, "
+                                  "or pass --allow-key-like if it's a dummy value")
 
 
 def check_writable(out: str, overwrite: bool) -> None:
@@ -406,13 +415,22 @@ def run(args, client, *, stdin=None, env=None, clock=time.monotonic, now=None, e
     # No SDK retries on the paid call: a retried request could be billed twice, past the cap.
     # Errors while opening the stream (status codes, connection) pass through as they are;
     # anything after that is a StreamFailed, since output may already have been billed.
+    failure = None
     with contextlib.ExitStack() as stack:
         stream = stack.enter_context(client.with_options(max_retries=0).beta.messages.stream(**params))
+        request_id = getattr(stream, "request_id", None)
         try:
             message = stream.get_final_message()
-        except Exception as e:
-            raise StreamFailed(e) from e
-        request_id = getattr(stream, "request_id", None)
+        except BaseException as e:
+            message = snapshot(stream)   # what streamed before the failure, if anything
+            if message is None:
+                if isinstance(e, KeyboardInterrupt):
+                    if request_id:
+                        print(f"review: request id {request_id}", file=err)
+                    raise
+                raise StreamFailed(e, request_id) from e
+            failure = (("interrupted (Ctrl-C)", 130) if isinstance(e, KeyboardInterrupt)
+                       else (f"the stream failed ({type(e).__name__}: {e})", 5))
     seconds = clock() - started
     try:
         raw_text = review_text(message)[0]
@@ -420,12 +438,35 @@ def run(args, client, *, stdin=None, env=None, clock=time.monotonic, now=None, e
         raw_text = ""
     try:
         return report(args, message, request_id, seconds, counts, worst, allowed, fallback,
-                      brief, materials, env, now, err, out)
-    except Exception as e:
+                      brief, materials, env, now, err, out, failure=failure)
+    except BaseException as e:
         print(f"review: paid, but the review couldn't be saved ({type(e).__name__}: {e}); "
-              "its text follows on stdout", file=err)
-        rescue(out, raw_text + "\n")
-        return 6
+              "its text and what is known of its bill follow on stdout", file=err)
+        rescue(out, raw_text + "\n\n" + bare_record(message, request_id, failure))
+        return 130 if isinstance(e, KeyboardInterrupt) else 6
+
+
+def snapshot(stream):
+    """The message as streamed so far, or None if nothing had arrived."""
+    try:
+        return stream.current_message_snapshot
+    except Exception:   # the SDK asserts when no event has arrived
+        return None
+
+
+def bare_record(message, request_id, failure) -> str:
+    """The bill's facts without the formatting that just failed."""
+    try:
+        usage = _as_dict(getattr(message, "usage", None))
+    except Exception:
+        usage = {}
+    record = {"request_id": request_id, "model": getattr(message, "model", None),
+              "stop_reason": getattr(message, "stop_reason", None), "usage": usage,
+              "usage_incomplete": failure is not None, "incomplete_because": failure and failure[0]}
+    try:
+        return json.dumps(record, indent=2, default=str) + "\n"
+    except Exception:
+        return json.dumps({"request_id": request_id}) + "\n"
 
 
 def rescue(out, text: str) -> None:
@@ -441,7 +482,7 @@ def rescue(out, text: str) -> None:
 
 
 def report(args, message, request_id, seconds, counts, worst, allowed, fallback,
-           brief, materials, env, now, err, out) -> int:
+           brief, materials, env, now, err, out, failure=None) -> int:
     rows, itemized = usage_rows(message, args.model)
     text, saw_switch, dropped_partial = review_text(message)
     iter_fallback = any(r["type"] == "fallback_message" for r in rows)
@@ -461,7 +502,12 @@ def report(args, message, request_id, seconds, counts, worst, allowed, fallback,
     details = _as_dict(getattr(message, "stop_details", None))
     when = (now or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    if stop == "refusal":
+    if failure is not None:
+        reason, code = failure
+        status = (f"INCOMPLETE: {reason} after output began. What arrived is below; the token "
+                  "counts are those streamed so far, so the bill may be higher.")
+        body = text
+    elif stop == "refusal":
         status = (f"DECLINED (category: {details.get('category') or 'none given'})"
                   + ("; the fallback declined too" if fell_back else "") + ". There is no review below.")
         body, code = "", 3
@@ -516,6 +562,7 @@ def report(args, message, request_id, seconds, counts, worst, allowed, fallback,
         "unpriced_models_ran": strays, "attempts": rows,
         "output_tokens_details": _as_dict(_as_dict(getattr(message, "usage", None)).get("output_tokens_details")) or None,
         "dropped_declined_partial": dropped_partial, "request_id": request_id, "account": account,
+        "usage_incomplete": failure is not None,
         "inputs": [{"kind": m.kind, "name": m.name, "sha256": m.sha256} for m in [brief, *materials]],
         "finished_at": when, "seconds": round(seconds, 1), "review_file": args.out,
     }
@@ -549,7 +596,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--effort", default="high", choices=EFFORTS)
     p.add_argument("--max-tokens", type=int, default=32_000,
                    help="output cap, thinking included; Fable can think through 4,000 before writing")
-    p.add_argument("--cap", type=float, default=5.0, help="refuse if the worst case costs more (USD)")
+    p.add_argument("--cap", type=float, default=5.0,
+                   help="refuse if the worst case costs more (USD); it allows 10%% plus 200 tokens more "
+                        "input than the free count, which Anthropic calls an estimate")
     p.add_argument("--dry-run", action="store_true", help="count tokens and price the worst case; send nothing")
     p.add_argument("--no-fallback", action="store_true", help="don't rerun a declined request on another model")
     p.add_argument("--no-line-numbers", action="store_true")
@@ -570,8 +619,9 @@ def main(argv: list[str] | None = None, *, sdk=None) -> int:
         print(f"review: {e}", file=sys.stderr)
         return 2
     except StreamFailed as e:
-        print(f"review: the request failed while the review was streaming ({e}); nothing was "
-              "written, and it may still be billed for what it produced.", file=sys.stderr)
+        print(f"review: the request failed while the review was streaming ({e}); nothing had "
+              "arrived to write, and it may still be billed for what it produced"
+              + (f" (request id {e.request_id})" if e.request_id else "") + ".", file=sys.stderr)
         return 5
     except KeyboardInterrupt:
         print("review: interrupted; a request already sent may still be billed.", file=sys.stderr)

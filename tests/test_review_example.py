@@ -30,8 +30,14 @@ def message(content=None, stop="end_turn", model="claude-fable-5-2", usage=None,
 
 
 class FakeStream:
-    def __init__(self, msg, raises=None, during=None):
+    def __init__(self, msg, raises=None, during=None, partial=None):
         self.msg, self.raises, self.during, self.request_id = msg, raises, during, "req_fake123"
+        self.partial = partial
+
+    @property
+    def current_message_snapshot(self):   # like the SDK: asserts until an event has arrived
+        assert self.partial is not None
+        return self.partial
 
     def __enter__(self):
         return self
@@ -50,7 +56,7 @@ class FakeStream:
 class FakeClient:
     """raises: an exception when the stream opens; mid_stream: one while it streams."""
 
-    def __init__(self, msg=None, counted=1000, raises=None, mid_stream=None, during=None):
+    def __init__(self, msg=None, counted=1000, raises=None, mid_stream=None, during=None, partial=None):
         self.calls, self.retries = [], []
         outer = self
 
@@ -65,7 +71,7 @@ class FakeClient:
                 outer.calls.append(("stream", kw))
                 if raises is not None:
                     raise raises
-                return FakeStream(msg if msg is not None else message(), mid_stream, during)
+                return FakeStream(msg if msg is not None else message(), mid_stream, during, partial)
 
         class Unretried:      # what with_options(max_retries=0) returns
             beta = SimpleNamespace(messages=BetaMessages())
@@ -427,6 +433,7 @@ def test_any_error_after_paying_still_saves_the_text(work, monkeypatch):
     monkeypatch.setattr(review, "usage_rows", broken)
     code, err = go(work, FakeClient(), str(work / "a.py"))
     assert code == 6 and "TypeError" in err and "VERDICT: APPROVE" in go.stdout
+    assert '"request_id": "req_fake123"' in go.stdout and '"output_tokens": 500' in go.stdout
 
 
 def test_the_rescue_writes_utf8_whatever_stdout_is(work, monkeypatch):
@@ -616,3 +623,80 @@ def test_the_cap_bounds_every_bill(model, fallback, max_tokens, data):
              "output_tokens": data.draw(st.integers(0, max_tokens))}
         bill += review.attempt_cost(m, u)["cost_usd"]
     assert bill <= worst + 1e-12
+
+
+# Round 3 (independent review): names, partial output, the cap's input margin.
+
+def test_the_job_key_in_a_file_name_is_refused_without_printing_it(work):
+    named = work / f"notes-{JOB_KEY}.txt"
+    named.write_text("plain text\n")
+    client = FakeClient()
+    with pytest.raises(review.Refused, match="the name of file input 2") as e:
+        go(work, client, str(named), "--allow-key-like")
+    assert JOB_KEY not in str(e.value) and client.calls == []
+
+
+def test_a_key_like_file_name_is_refused_unless_allowed(work):
+    dummy = "sk-ant-api03-" + "Z" * 40
+    named = work / f"{dummy}.txt"
+    named.write_text("plain text\n")
+    with pytest.raises(review.Refused, match="looks like an Anthropic") as e:
+        go(work, FakeClient(), str(named))
+    assert dummy not in str(e.value)
+    assert go(work, FakeClient(), str(named), "--allow-key-like")[0] == 0
+
+
+def test_a_key_in_the_brief_name_is_refused(work):
+    named = work / f"{JOB_KEY}.md"
+    named.write_text("Review it.\n")
+    with pytest.raises(review.Refused, match="the name of brief input 1"):
+        go(work, FakeClient(), str(work / "a.py"), brief=str(named))
+
+
+def partial_message():
+    return message(content=[text("VERDICT: REQUEST_CHANGES\n\n1. P1 half a find")], stop=None,
+                   usage={"input_tokens": 1000, "output_tokens": 20})
+
+
+@pytest.mark.parametrize("exc, code", [(LostConnection("connection reset"), 5), (KeyboardInterrupt(), 130)])
+def test_what_streamed_is_saved_when_the_stream_breaks(work, exc, code):
+    rc, err = go(work, FakeClient(mid_stream=exc, partial=partial_message()), str(work / "a.py"))
+    md, rec = outputs(work)
+    assert rc == code and "INCOMPLETE" in md and "half a find" in md and "the bill may be higher" in md
+    assert rec["usage_incomplete"] is True and rec["exit_code"] == code
+    assert rec["request_id"] == "req_fake123" and rec["attempts"][0]["output_tokens"] == 20
+
+
+def test_ctrl_c_before_any_output_names_the_request(work):
+    args = review.parser().parse_args(["--brief", str(work / "brief.md"), "--out", str(work / "out.md"),
+                                       str(work / "a.py")])
+    err = io.StringIO()
+    with pytest.raises(KeyboardInterrupt):
+        review.run(args, FakeClient(mid_stream=KeyboardInterrupt()), env={"ANTHROPIC_API_KEY": JOB_KEY},
+                   err=err, out=io.StringIO(), clock=iter([0.0, 1.0]).__next__)
+    assert "req_fake123" in err.getvalue() and not (work / "out.md").exists()
+
+
+def test_a_stream_failure_before_output_names_the_request(work, monkeypatch, capsys):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", JOB_KEY)
+    argv = ["--brief", str(work / "brief.md"), "--out", str(work / "out.md"), str(work / "a.py")]
+    assert review.main(argv, sdk=FakeSDK(FakeClient(mid_stream=LostConnection("reset")))) == 5
+    assert "request id req_fake123" in capsys.readouterr().err
+
+
+def test_ctrl_c_while_saving_still_hands_over_the_review(work, monkeypatch):
+    def interrupted(*a):
+        raise KeyboardInterrupt()
+    monkeypatch.setattr(review, "usage_rows", interrupted)
+    code, err = go(work, FakeClient(), str(work / "a.py"))
+    assert code == 130 and "VERDICT: APPROVE" in go.stdout and "req_fake123" in go.stdout
+
+
+def test_the_bill_is_flagged_once_input_passes_the_counting_margin(work):
+    counted = 1000
+    bound = review.billable_input_bound(counted)
+    for billed, flagged in ((bound, False), (bound + 1, True)):
+        msg = message(usage={"input_tokens": billed, "output_tokens": 32_000})
+        go(work, FakeClient(msg, counted=counted), str(work / "a.py"), "--no-fallback", "--overwrite")
+        md, rec = outputs(work)
+        assert rec["over_worst_case"] is flagged and ("WARNING" in md) is flagged
